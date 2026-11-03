@@ -1,0 +1,4 @@
+# build outputs
+*.o
+*.so
+*.bc
