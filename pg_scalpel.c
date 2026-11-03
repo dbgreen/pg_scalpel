@@ -2,6 +2,8 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "access/xact.h"
+#include "utils/resowner.h"
 #include "janet.h"
 
 #include "pg_scalpel.h"
@@ -18,13 +20,95 @@ jpgs_backend_pid(int32_t argc, Janet *argv)
     janet_fixarity(argc, 0);
     return janet_wrap_integer(MyProcPid);
 }
+static Datum
+thunk_parse_int(void *arg)
+{
+    return DirectFunctionCall1(int4in, CStringGetDatum((char *) arg));
+}
 
+static Janet
+jpgs_parse_int(int32_t argc, Janet *argv)
+{
+    const char *s = (const char *) janet_getcstring(argv, 0);
+    Datum       result;
+    PgsError    err;
+
+    if (pgs_guarded_call(thunk_parse_int, (void *) s, &result, &err))
+        return pgs_ok(janet_wrap_integer(DatumGetInt32(result)));
+    return pgs_err_value(&err);
+}
 static const JanetReg pgs_cfuns[] = {
     {"backend-pid", jpgs_backend_pid,
      "(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
+    {"parse-int",jpgs_parse_int,
+     "(scalpel/parse-int str)\n\nParse str as an int4, the way '...'::int does."},
     {NULL, NULL, NULL}
 };
 
+Janet
+pgs_ok(Janet value)
+{
+    Janet      *tup = janet_tuple_begin(2);
+
+    tup[0] = janet_ckeywordv("ok");
+    tup[1] = value;
+    return janet_wrap_tuple(janet_tuple_end(tup));
+}
+
+Janet
+pgs_err_value(PgsError *e)
+{
+    JanetTable *t = janet_table(2);
+    Janet      *tup;
+
+    janet_table_put(t, janet_ckeywordv("sqlstate"), janet_cstringv(e->sqlstate));
+    if (e->message)
+        janet_table_put(t, janet_ckeywordv("message"), janet_cstringv(e->message));
+
+    tup = janet_tuple_begin(2);
+    tup[0] = janet_ckeywordv("error");
+    tup[1] = janet_wrap_table(t);
+    return janet_wrap_tuple(janet_tuple_end(tup));
+}
+
+bool
+pgs_guarded_call(PgsThunk thunk, void *arg, Datum *result, PgsError *err)
+{
+    MemoryContext oldcontext = CurrentMemoryContext;
+    ResourceOwner oldowner   = CurrentResourceOwner;
+    volatile bool ok = false;
+
+    BeginInternalSubTransaction(NULL);
+    MemoryContextSwitchTo(oldcontext);          /* copies below land in the outer ctx */
+
+    PG_TRY();
+    {
+        Datum d = thunk(arg);                   /* the risky call */
+        ReleaseCurrentSubTransaction();         /* success: commit it */
+        MemoryContextSwitchTo(oldcontext);
+        CurrentResourceOwner = oldowner;
+        *result = d;
+        ok = true;
+    }
+    PG_CATCH();
+    {
+        ErrorData *edata;
+        MemoryContextSwitchTo(oldcontext);      /* BEFORE CopyErrorData, or UAF */
+        edata = CopyErrorData();
+        FlushErrorState();
+        RollbackAndReleaseCurrentSubTransaction();  /* failure: unwind everything */
+        MemoryContextSwitchTo(oldcontext);
+        CurrentResourceOwner = oldowner;
+
+        err->sqlstate = pstrdup(unpack_sql_state(edata->sqlerrcode));
+        err->message  = edata->message ? pstrdup(edata->message) : NULL;
+        FreeErrorData(edata);
+        ok = false;
+    }
+    PG_END_TRY();
+
+    return ok;
+}
 
 
 
