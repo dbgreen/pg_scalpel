@@ -1,0 +1,105 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# pg_scalpel leans on DWARF (struct/sig) and symbol resolution, so we build
+# PostgreSQL from source with debug info rather than use a (stripped) package.
+# PG 19 is pre-release; pin the ref here. The built tree is cached, so it only
+# compiles on the first run (or when PG_REF changes).
+env:
+  PG_REF: REL_19_STABLE
+  PGINST: /home/runner/pginstall
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake bison flex \
+            libffi-dev libdw-dev libelf-dev
+
+      - name: Cache PostgreSQL build
+        id: pgcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PGINST }}
+          key: pg-${{ env.PG_REF }}-${{ runner.os }}-v1
+
+      - name: Build PostgreSQL from source (debug)
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$PG_REF" https://github.com/postgres/postgres.git pgsrc
+          cd pgsrc
+          ./configure --prefix="$PGINST" --enable-debug --enable-cassert \
+            --without-icu --without-readline --without-zlib
+          make -j"$(nproc)"
+          make install
+
+      - name: Build and install pg_scalpel
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          make vendor
+          make
+          make install
+
+      - name: Start a throwaway cluster
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          initdb -D "$PWD/pgdata" -A trust -U postgres >/dev/null
+          echo "port = 5455" >> pgdata/postgresql.conf
+          echo "listen_addresses = '127.0.0.1'" >> pgdata/postgresql.conf
+          # readable NodeTag names for the planner-observatory example
+          export PGJ_NODETAGS="$PGINST/include/postgresql/server/nodes/nodetags.h"
+          pg_ctl -D "$PWD/pgdata" -l pgdata/log -w start
+
+      - name: Create extension + run smoke tests
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          Q() { psql -h 127.0.0.1 -p 5455 -U postgres -Atc "$1"; }
+          psql -h 127.0.0.1 -p 5455 -U postgres -v ON_ERROR_STOP=1 -c "CREATE EXTENSION pg_scalpel;"
+
+          fail() { echo "FAIL: $1"; pg_ctl -D "$PWD/pgdata" stop >/dev/null 2>&1 || true; exit 1; }
+
+          # arithmetic
+          [ "$(Q "select janet_eval('(+ 40 2)')")" = "42" ] || fail "janet_eval arithmetic"
+
+          # call an exported libc function (no debug info needed)
+          [ "$(Q "select janet_eval(\$j\$ (string/format \"%q\" (scalpel/call (scalpel/resolve \"strlen\") :uint64 [:cstring] \"hello, scalpel\")) \$j\$)")" \
+            = "(:ok <core/u64 14>)" ] || fail "scalpel/call strlen"
+
+          # DWARF struct layout (needs the debug build above)
+          [ "$(Q "select janet_eval(\$j\$ (get (scalpel/struct \"Path\") :size) \$j\$)")" = "80" ] || fail "scalpel/struct Path size"
+
+          # closure + hook: replace int4pl with Janet (one session)
+          out=$(psql -h 127.0.0.1 -p 5455 -U postgres -At <<'SQL'
+select janet_eval($j$
+  (def d (scalpel/closure :uint64 [:pointer]
+    (fn [fc] (+ (scalpel/getarg fc 0 :int) (scalpel/getarg fc 1 :int) 100))))
+  (scalpel/hook (scalpel/resolve "int4pl") d) "ok" $j$);
+SELECT 2 + 3;
+select janet_eval($j$ (scalpel/unhook (scalpel/resolve "int4pl")) $j$);
+SELECT 2 + 3;
+SQL
+)
+          echo "$out" | grep -qx "105" || fail "closure-replaced int4pl (expected 105)"
+          echo "$out" | grep -qx "5"   || fail "int4pl restored after unhook (expected 5)"
+
+          # superuser lockdown: a non-superuser is refused
+          psql -h 127.0.0.1 -p 5455 -U postgres -q -c "CREATE ROLE alice LOGIN;"
+          err=$(psql -h 127.0.0.1 -p 5455 -U alice -d postgres -Atc "select janet_eval('(+ 1 1)')" 2>&1 || true)
+          echo "$err" | grep -q "permission denied for function janet_eval" || fail "non-superuser should be refused ($err)"
+
+          echo "all smoke tests passed"
+          pg_ctl -D "$PWD/pgdata" stop >/dev/null 2>&1 || true
