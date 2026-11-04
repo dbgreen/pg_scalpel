@@ -190,6 +190,49 @@ SELECT janet_eval($j$ (PO :dump) $j$);     -- the grouped, cost-sorted candidate
 SELECT janet_eval($j$ (PO :disarm) $j$);
 ```
 
+`(PO :dump)` prints the candidates — here on a 5000-row, indexed, analyzed `t`
+(exact paths and costs move with the data and stats):
+
+```
+planner candidates: 24 paths over 4 rel(s)
+  legend:  * winner (cheapest_total_path)   + survived (kept in pathlist)   x rejected (dominated/pruned)   param = per-execution cost
+
+  t  (8 considered, 3 kept, 5 rejected)
+    + IndexScan        rows=5         cost=     0.28..1.31       param
+    * SeqScan          rows=499       cost=     0.00..85.50
+    + IndexScan        rows=499       cost=     0.28..203.73
+    x IndexOnlyScan    rows=50        cost=     0.28..1.21       param
+    x BitmapHeapScan   rows=50        cost=     0.73..5.35       param
+    x BitmapHeapScan   rows=5         cost=     0.66..5.41       param
+    x SeqScan          rows=5000      cost=     0.00..73.00
+    x IndexOnlyScan    rows=5000      cost=     0.28..99.28
+
+  {1,2}  (12 considered, 1 kept, 11 rejected)
+    * HashJoin         rows=24950     cost=   135.50..502.94
+    x NestLoop         rows=24950     cost=     0.29..524.61
+    x NestLoop         rows=24950     cost=     0.29..579.92
+    x MergeJoin        rows=24950     cost=   108.14..593.89
+    x NestLoop         rows=24950     cost=     0.57..606.20
+    x NestLoop         rows=24950     cost=     0.57..642.83
+    x MergeJoin        rows=24950     cost=     0.56..678.51
+    x MergeJoin        rows=24950     cost=     0.56..689.76
+    x HashJoin         rows=24950     cost=    91.74..739.24
+    x MergeJoin        rows=24950     cost=   488.06..864.80
+    x MergeJoin        rows=24950     cost=   488.06..887.31
+    x NestLoop         rows=24950     cost=     0.28..940.59
+
+  {1}  (1 considered, 0 kept, 1 rejected)
+    x Result           rows=1         cost=     0.00..0.01
+
+  {}  (3 considered, 2 kept, 1 rejected)
+    * Agg              rows=1         cost=   565.31..565.32
+    + Agg              rows=1         cost=   565.31..565.32
+    x Result           rows=1         cost=     0.00..0.01
+```
+
+EXPLAIN shows you the winner; this shows the eleven join paths it rejected, with
+their costs — read out of the `RelOptInfo` and `Path` structs mid-plan.
+
 ## The sharp end
 
 `janet_eval` runs native code as whatever OS user Postgres runs as. Janet by
