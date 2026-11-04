@@ -69,6 +69,11 @@ primitives are named `scalpel/...`, and a small Janet prelude (`hook-fn`,
 `make-struct`, `trace`, the rest of it) is already loaded by the time you get a
 prompt.
 
+If you've never written Janet, the whole interface is Janet, so start with the
+[language docs](https://janet-lang.org/docs/index.html) and the
+[API reference](https://janet-lang.org/api/index.html) — it's a small Lisp and an
+afternoon is plenty.
+
 The VM stays alive for the life of your connection, so whatever you set up in one
 statement is still there in the next — as long as it's the same psql session. The
 multi-statement examples here count on that.
