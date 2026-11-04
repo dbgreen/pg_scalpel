@@ -5,6 +5,8 @@
 #include "utils/lsyscache.h"
 #include "libpq/pqformat.h"
 #include "lib/stringinfo.h"
+#include "executor/executor.h"
+#include "catalog/pg_type.h"
 #include "access/xact.h"
 #include "utils/resowner.h"
 #include "dlfcn.h"
@@ -61,6 +63,13 @@ typedef struct PgsClosure
 	PgsCType	atypes[PGS_CLOSURE_MAXARGS];
 	ffi_type   *ftypes[PGS_CLOSURE_MAXARGS];
 } PgsClosure;
+
+static Janet pgs_row_filter;
+static bool pgs_row_filter_set = false;
+static int	pgs_icept_col = -1;
+static bool pgs_icept_isnull = false;
+static int32 pgs_icept_value = 0;
+static ExecutorRun_hook_type prev_ExecutorRun_hook = NULL;
 
 
 JanetTable *pgs_env = NULL;
@@ -749,6 +758,188 @@ jpgs_setresult_isnull(int32_t argc, Janet *argv)
 	return janet_wrap_nil();
 }
 
+typedef struct
+{
+	DestReceiver pub;
+	DestReceiver *orig;
+	int			col;
+	bool		isnull;
+	int32		value;
+} PgsInterceptDest;
+
+static void
+icept_startup(DestReceiver *self, int operation, TupleDesc typeinfo)
+{
+	DestReceiver *orig = ((PgsInterceptDest *) self)->orig;
+
+	orig->rStartup(orig, operation, typeinfo);
+}
+
+static void
+pgs_apply_row_filter(TupleTableSlot *slot)
+{
+	TupleDesc	td = slot->tts_tupleDescriptor;
+	int			n = td->natts;
+	JanetArray *row = janet_array(n);
+	Janet		args[1];
+	Janet		out = janet_wrap_nil();
+	JanetFiber *fiber = NULL;
+	const Janet *items;
+	int32_t		olen;
+	int			i;
+
+	slot_getallattrs(slot);
+	for (i = 0; i < n; i++)
+	{
+		if (slot->tts_isnull[i])
+			janet_array_push(row, janet_wrap_nil());
+		else
+		{
+			Oid			outfn;
+			bool		isvarlena;
+
+			getTypeOutputInfo(TupleDescAttr(td, i)->atttypid, &outfn, &isvarlena);
+			janet_array_push(row,
+							 janet_cstringv(OidOutputFunctionCall(outfn,
+																  slot->tts_values[i])));
+		}
+	}
+
+	args[0] = janet_wrap_array(row);
+	if (janet_pcall(janet_unwrap_function(pgs_row_filter), 1, args, &out, &fiber)
+		!= JANET_SIGNAL_OK)
+		return;
+	if (!janet_indexed_view(out, &items, &olen))
+		return;
+
+	for (i = 0; i < n && i < olen; i++)
+	{
+		Janet		cell = items[i];
+
+		if (janet_checktype(cell, JANET_NIL))
+			slot->tts_isnull[i] = true;
+		else if (janet_checktype(cell, JANET_STRING))
+		{
+			Oid			infn,
+						ioparam;
+
+			getTypeInputInfo(TupleDescAttr(td, i)->atttypid, &infn, &ioparam);
+			slot->tts_values[i] =
+				OidInputFunctionCall(infn,
+									 (char *) janet_unwrap_string(cell),
+									 ioparam, TupleDescAttr(td, i)->atttypmod);
+			slot->tts_isnull[i] = false;
+		}
+	}
+}
+
+static bool
+icept_receive(TupleTableSlot *slot, DestReceiver *self)
+{
+	PgsInterceptDest *d = (PgsInterceptDest *) self;
+
+	if (pgs_row_filter_set)
+		pgs_apply_row_filter(slot);
+	else if (d->col >= 0 && d->col < slot->tts_tupleDescriptor->natts)
+	{
+		slot_getallattrs(slot);
+		if (d->isnull)
+			slot->tts_isnull[d->col] = true;
+		else if (TupleDescAttr(slot->tts_tupleDescriptor, d->col)->atttypid == INT4OID)
+		{
+			slot->tts_values[d->col] = Int32GetDatum(d->value);
+			slot->tts_isnull[d->col] = false;
+		}
+	}
+	return d->orig->receiveSlot(slot, d->orig);
+}
+
+static void
+icept_shutdown(DestReceiver *self)
+{
+	DestReceiver *orig = ((PgsInterceptDest *) self)->orig;
+
+	orig->rShutdown(orig);
+}
+
+static void
+icept_destroy(DestReceiver *self)
+{
+	DestReceiver *orig = ((PgsInterceptDest *) self)->orig;
+
+	orig->rDestroy(orig);
+	pfree(self);
+}
+
+static DestReceiver *
+pgs_wrap_dest(DestReceiver *orig)
+{
+	PgsInterceptDest *d = (PgsInterceptDest *) palloc0(sizeof(PgsInterceptDest));
+
+	d->pub.receiveSlot = icept_receive;
+	d->pub.rStartup = icept_startup;
+	d->pub.rShutdown = icept_shutdown;
+	d->pub.rDestroy = icept_destroy;
+	d->pub.mydest = orig->mydest;
+	d->orig = orig;
+	d->col = pgs_icept_col;
+	d->isnull = pgs_icept_isnull;
+	d->value = pgs_icept_value;
+	return (DestReceiver *) d;
+}
+
+static void
+pgs_ExecutorRun(QueryDesc *queryDesc, ScanDirection direction, uint64 count)
+{
+	DestReceiver *orig = queryDesc->dest;
+	bool		wrapped = false;
+
+	if ((pgs_icept_col >= 0 || pgs_row_filter_set) && orig != NULL)
+	{
+		queryDesc->dest = pgs_wrap_dest(orig);
+		wrapped = true;
+	}
+	if (prev_ExecutorRun_hook)
+		prev_ExecutorRun_hook(queryDesc, direction, count);
+	else
+		standard_ExecutorRun(queryDesc, direction, count);
+	if (wrapped)
+		queryDesc->dest = orig;
+}
+
+static bool pgs_icept_hook_installed = false;
+
+static void
+pgs_ensure_icept_hook(void)
+{
+	if (pgs_icept_hook_installed)
+		return;
+	prev_ExecutorRun_hook = ExecutorRun_hook;
+	ExecutorRun_hook = pgs_ExecutorRun;
+	pgs_icept_hook_installed = true;
+}
+
+static Janet
+jscalpel_intercept_rows(int32_t argc, Janet *argv)
+{
+	janet_fixarity(argc, 1);
+	if (pgs_row_filter_set)
+	{
+		janet_gcunroot(pgs_row_filter);
+		pgs_row_filter_set = false;
+	}
+	if (!janet_checktype(argv[0], JANET_NIL))
+	{
+		if (!janet_checktype(argv[0], JANET_FUNCTION))
+			janet_panicf("scalpel/intercept-rows: expected a function or nil, got %v", argv[0]);
+		pgs_row_filter = argv[0];
+		janet_gcroot(pgs_row_filter);
+		pgs_row_filter_set = true;
+		pgs_ensure_icept_hook();
+	}
+	return janet_wrap_nil();
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -797,6 +988,8 @@ static const JanetReg pgs_cfuns[] = {
 	"(scalpel/getarg fcinfo n type)\n\nRead the n-th fmgr arg from fcinfo as type."},
 	{"setresult-isnull", jpgs_setresult_isnull,
 	"(scalpel/setresult-isnull fcinfo bool)\n\nSet an fmgr replacement result to SQL NULL."},
+	{"intercept-rows", jscalpel_intercept_rows,
+	"(scalpel/intercept-rows f|nil)\n\nInstall a per-row output filter, or nil to clear."},
 	{NULL, NULL, NULL}
 };
 
