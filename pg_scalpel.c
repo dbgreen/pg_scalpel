@@ -248,7 +248,7 @@ thunk_ffi_call(void *arg)
 }
 
 static Janet
-jpgs_call(int32_t argc, Janet *argv)
+pgs_do_call(int32_t argc, Janet *argv, bool guarded)
 {
 	void	   *fnaddr = pgs_as_ptr(argv[0]);
 	PgsCType	rtype = pgs_parse_type(argv[1]);
@@ -283,7 +283,13 @@ jpgs_call(int32_t argc, Janet *argv)
 	ctx.avalues = avalues;
 	ctx.ret = &ret;
 
-	ok = pgs_guarded_call(thunk_ffi_call, &ctx, &dummy, &err);
+	if (guarded)
+		ok = pgs_guarded_call(thunk_ffi_call, &ctx, &dummy, &err);
+	else
+	{
+		thunk_ffi_call(&ctx);
+		ok = true;
+	}
 
 	janet_sfree(etypes);
 	janet_sfree(ftypes);
@@ -291,6 +297,18 @@ jpgs_call(int32_t argc, Janet *argv)
 	janet_sfree(slots);
 
 	return ok ? pgs_ok(pgs_marshal_ret(rtype, &ret)) : pgs_err_value(&err);
+}
+
+static Janet
+jpgs_call(int32_t argc, Janet *argv)
+{
+	return pgs_do_call(argc, argv, true);
+}
+
+static Janet
+jpgs_call_raw(int32_t argc, Janet *argv)
+{
+	return pgs_do_call(argc, argv, false);
 }
 
 static Janet
@@ -519,6 +537,104 @@ jpgs_disasm(int32_t argc, Janet *argv)
 	return pgs_disasm(pgs_as_ptr(argv[0]), len);
 }
 
+static Datum
+thunk_raise(void *arg)
+{
+	ereport(ERROR,
+			(errcode(ERRCODE_RAISE_EXCEPTION),
+			 errmsg("pg_scalpel test raise: %s", (char *) arg)));
+	return (Datum) 0;
+}
+
+static Janet
+jpgs_raise(int32_t argc, Janet *argv)
+{
+	const char *s;
+	Datum		result;
+	PgsError	err;
+
+	janet_fixarity(argc, 1);
+	s = (const char *) janet_getcstring(argv, 0);
+	if (pgs_guarded_call(thunk_raise, (void *) s, &result, &err))
+		return pgs_ok(janet_wrap_nil());
+	return pgs_err_value(&err);
+}
+
+static Janet
+jpgs_syms(int32_t argc, Janet *argv)
+{
+	int			limit = 1000;
+
+	janet_arity(argc, 1, 2);
+	if (argc >= 2)
+		limit = (int) janet_getinteger(argv, 1);
+	return pgs_sym_enumerate((const char *) janet_getcstring(argv, 0), limit);
+}
+
+static Janet
+jpgs_scan(int32_t argc, Janet *argv)
+{
+	uint8_t    *start;
+	size_t		size;
+	JanetByteView pat;
+	JanetByteView mask;
+	bool		have_mask = false;
+	JanetArray *arr;
+	size_t		i;
+	int32_t		j;
+
+	janet_arity(argc, 3, 4);
+	start = (uint8_t *) pgs_as_ptr(argv[0]);
+	size = (size_t) janet_getnumber(argv, 1);
+	pat = janet_getbytes(argv, 2);
+	if (argc == 4)
+	{
+		mask = janet_getbytes(argv, 3);
+		have_mask = true;
+		if (mask.len != pat.len)
+			janet_panic("scalpel/scan: mask length must equal pattern length");
+	}
+	if (pat.len == 0 || size < (size_t) pat.len)
+		return janet_wrap_array(janet_array(0));
+	arr = janet_array(0);
+	for (i = 0; i + (size_t) pat.len <= size; i++)
+	{
+		bool		hit = true;
+
+		for (j = 0; j < pat.len; j++)
+		{
+			if (have_mask && mask.bytes[j] == 0)
+				continue;
+			if (start[i + j] != pat.bytes[j])
+			{
+				hit = false;
+				break;
+			}
+		}
+		if (hit)
+			janet_array_push(arr, janet_wrap_pointer(start + i));
+	}
+	return janet_wrap_array(arr);
+}
+
+static Janet
+jpgs_sym_from_addr(int32_t argc, Janet *argv)
+{
+	janet_fixarity(argc, 1);
+	return pgs_sym_from_addr(pgs_as_ptr(argv[0]));
+}
+
+static Janet
+jpgs_backtrace(int32_t argc, Janet *argv)
+{
+	int			maxf = 32;
+
+	janet_arity(argc, 0, 1);
+	if (argc == 1)
+		maxf = (int) janet_getinteger(argv, 0);
+	return pgs_backtrace(maxf);
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -549,6 +665,18 @@ static const JanetReg pgs_cfuns[] = {
 	"(scalpel/image-range &opt module)\n\nBase/size of a loaded module and its .text."},
 	{"disasm", jpgs_disasm,
 	"(scalpel/disasm addr &opt len)\n\nDisassemble live bytes at addr."},
+	{"call-raw", jpgs_call_raw,
+	"(scalpel/call-raw fn ret [argtypes] args...)\n\nUNGUARDED call; only for leaf fns that cannot ereport."},
+	{"raise", jpgs_raise,
+	"(scalpel/raise msg)\n\nRaise a test ereport; comes back as [:error {...}]."},
+	{"syms", jpgs_syms,
+	"(scalpel/syms pattern &opt limit)\n\nEnumerate symbols matching a glob."},
+	{"scan", jpgs_scan,
+	"(scalpel/scan start size pattern &opt mask)\n\nScan a byte range for a pattern."},
+	{"sym-from-addr", jpgs_sym_from_addr,
+	"(scalpel/sym-from-addr addr)\n\nNearest preceding symbol for a code address."},
+	{"backtrace", jpgs_backtrace,
+	"(scalpel/backtrace &opt maxframes)\n\nSymbolized C stack."},
 	{NULL, NULL, NULL}
 };
 

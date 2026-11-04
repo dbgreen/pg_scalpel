@@ -23,5 +23,8 @@ extern Janet pgs_sym_struct(const char *name);
 extern Janet pgs_sym_signature(const char *name);
 extern Janet pgs_image_range(const char *module_or_null);
 extern Janet pgs_disasm(void *addr, int len);
+extern Janet pgs_sym_enumerate(const char *pattern, int limit);
+extern Janet pgs_sym_from_addr(void *addr);
+extern Janet pgs_backtrace(int maxframes);
 
 #endif

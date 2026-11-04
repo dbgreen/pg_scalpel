@@ -5,6 +5,7 @@
 #include <elfutils/libdwfl.h>
 #include <gelf.h>
 #include <string.h>
+#include <execinfo.h>
 #include <dwarf.h>
 #include "janet.h"
 #include "pg_scalpel.h"
@@ -367,4 +368,151 @@ pgs_image_range(const char *module_or_null)
 		}
 	}
 	return janet_wrap_table(t);
+}
+
+static bool
+glob_match(const char *pat, const char *str)
+{
+	while (*pat)
+	{
+		if (*pat == '*')
+		{
+			pat++;
+			if (!*pat)
+				return true;
+			for (; *str; str++)
+				if (glob_match(pat, str))
+					return true;
+			return false;
+		}
+		else if (*pat == '?')
+		{
+			if (!*str)
+				return false;
+			pat++;
+			str++;
+		}
+		else
+		{
+			if (*pat != *str)
+				return false;
+			pat++;
+			str++;
+		}
+	}
+	return !*str;
+}
+
+typedef struct
+{
+	const char *pat;
+	int			limit;
+	JanetArray *out;
+} PgsEnumCtx;
+
+static int
+enum_cb(Dwfl_Module *mod, void **u, const char *modname,
+		Dwarf_Addr start, void *arg)
+{
+	PgsEnumCtx *c = (PgsEnumCtx *) arg;
+	int			n = dwfl_module_getsymtab(mod);
+	int			i;
+
+	(void) u;
+	(void) modname;
+	(void) start;
+	for (i = 0; i < n && c->out->count < c->limit; i++)
+	{
+		GElf_Sym	sym;
+		GElf_Addr	addr = 0;
+		const char *nm = dwfl_module_getsym_info(mod, i, &sym, &addr,
+												 NULL, NULL, NULL);
+		JanetTable *t;
+
+		if (nm == NULL || nm[0] == '\0' || addr == 0)
+			continue;
+		if (GELF_ST_TYPE(sym.st_info) != STT_FUNC &&
+			GELF_ST_TYPE(sym.st_info) != STT_GNU_IFUNC)
+			continue;
+		if (!glob_match(c->pat, nm))
+			continue;
+		t = janet_table(2);
+		janet_table_put(t, CK("name"), janet_cstringv(nm));
+		janet_table_put(t, CK("addr"),
+						janet_wrap_pointer((void *) (uintptr_t) addr));
+		janet_array_push(c->out, janet_wrap_table(t));
+	}
+	return (c->out->count < c->limit) ? DWARF_CB_OK : DWARF_CB_ABORT;
+}
+
+Janet
+pgs_sym_enumerate(const char *pattern, int limit)
+{
+	PgsEnumCtx	ctx;
+
+	pgs_sym_init();
+	if (limit <= 0)
+		limit = 1000;
+	ctx.pat = pattern;
+	ctx.limit = limit;
+	ctx.out = janet_array(0);
+	dwfl_getmodules(pgs_dwfl, enum_cb, &ctx, 0);
+	return janet_wrap_array(ctx.out);
+}
+
+Janet
+pgs_sym_from_addr(void *addr)
+{
+	Dwfl_Module *m;
+	GElf_Off	off = 0;
+	GElf_Sym	sym;
+	const char *nm;
+	Dwarf_Addr	a = (Dwarf_Addr) (uintptr_t) addr;
+	JanetTable *t;
+
+	pgs_sym_init();
+	m = dwfl_addrmodule(pgs_dwfl, a);
+	if (m == NULL)
+		return janet_wrap_nil();
+	nm = dwfl_module_addrinfo(m, a, &off, &sym, NULL, NULL, NULL);
+	if (nm == NULL)
+		return janet_wrap_nil();
+	t = janet_table(3);
+	janet_table_put(t, CK("name"), janet_cstringv(nm));
+	janet_table_put(t, CK("addr"),
+					janet_wrap_pointer((void *) (uintptr_t) (a - off)));
+	janet_table_put(t, CK("displacement"), janet_wrap_number((double) off));
+	return janet_wrap_table(t);
+}
+
+Janet
+pgs_backtrace(int maxframes)
+{
+	void	   *frames[128];
+	int			n,
+				i;
+	JanetArray *arr;
+
+	if (maxframes < 1)
+		maxframes = 32;
+	if (maxframes > 128)
+		maxframes = 128;
+	pgs_sym_init();
+	n = backtrace(frames, maxframes);
+	arr = janet_array(0);
+	for (i = 1; i < n; i++)
+	{
+		Janet		sym = pgs_sym_from_addr(frames[i]);
+		JanetTable *t;
+
+		if (janet_checktype(sym, JANET_TABLE))
+			t = janet_unwrap_table(sym);
+		else
+		{
+			t = janet_table(1);
+			janet_table_put(t, CK("addr"), janet_wrap_pointer(frames[i]));
+		}
+		janet_array_push(arr, janet_wrap_table(t));
+	}
+	return janet_wrap_array(arr);
 }
