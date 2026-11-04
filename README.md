@@ -189,18 +189,11 @@ That's locking the door, not making the room safe. The sharp instruments are the
 whole reason the thing exists; there's nothing to sandbox. Don't put it on a box
 where people you don't trust can connect.
 
-## The files
+## License
 
-```
-pg_scalpel.c          the SQL entry point, the scalpel/* primitives, the guard, the VM
-pgs_sym_linux.c       symbols, structs, signatures, backtraces (elfutils + DWARF)
-pgs_hook_funchook.c   the hooking backend (funchook)
-pgs_disasm.c          live disassembly (capstone)
-pgs_timer.c           the interrupt timer that keeps a runaway script cancelable
-janet-lib/            the Janet prelude source, baked into pgs_prelude.h at build
-tools/                embed-prelude.janet, which does that baking
-vendor/               Janet and funchook, as submodules
-```
+pg_scalpel is under the PostgreSQL License — see [LICENSE](LICENSE).
 
-Janet is MIT, capstone is BSD, funchook carries its own license; see each
-vendored repo.
+It links a handful of other people's work, all under licenses that allow it:
+funchook (GPLv2+ with a linking exception), capstone (BSD), Janet (MIT), libffi
+(MIT-style), and elfutils (LGPL, linked dynamically). Their license texts ride
+along with the vendored submodules; carry them with any binary you ship.
