@@ -116,18 +116,36 @@ jpgs_parse_int(int32_t argc, Janet *argv)
 static PgsCType
 pgs_parse_type(Janet v)
 {
-	const uint8_t *k = janet_unwrap_keyword(v);
+	const uint8_t *k;
+
+	if (!janet_checktype(v, JANET_KEYWORD))
+		janet_panicf("scalpel/call: expected a type keyword, got %v", v);
+	k = janet_unwrap_keyword(v);
 
 	if (!janet_cstrcmp(k, "void"))
 		return PGS_T_VOID;
-	if (!janet_cstrcmp(k, "int"))
+	if (!janet_cstrcmp(k, "int") || !janet_cstrcmp(k, "int32"))
 		return PGS_T_INT;
+	if (!janet_cstrcmp(k, "uint") || !janet_cstrcmp(k, "uint32"))
+		return PGS_T_UINT;
+	if (!janet_cstrcmp(k, "int64"))
+		return PGS_T_INT64;
 	if (!janet_cstrcmp(k, "uint64"))
 		return PGS_T_UINT64;
+	if (!janet_cstrcmp(k, "bool"))
+		return PGS_T_BOOL;
 	if (!janet_cstrcmp(k, "pointer") || !janet_cstrcmp(k, "ptr"))
 		return PGS_T_POINTER;
-	if (!janet_cstrcmp(k, "cstring"))
+	if (!janet_cstrcmp(k, "datum"))
+		return PGS_T_DATUM;
+	if (!janet_cstrcmp(k, "cstring") || !janet_cstrcmp(k, "string"))
 		return PGS_T_CSTRING;
+	if (!janet_cstrcmp(k, "bytes") || !janet_cstrcmp(k, "buf"))
+		return PGS_T_BYTES;
+	if (!janet_cstrcmp(k, "double"))
+		return PGS_T_DOUBLE;
+	if (!janet_cstrcmp(k, "float"))
+		return PGS_T_FLOAT;
 	janet_panicf("scalpel/call: unknown type :%s", (const char *) k);
 }
 
@@ -140,8 +158,14 @@ pgs_ffi_type(PgsCType t)
 			return &ffi_type_void;
 		case PGS_T_INT:
 			return &ffi_type_sint32;
+		case PGS_T_UINT:
+			return &ffi_type_uint32;
+		case PGS_T_INT64:
+			return &ffi_type_sint64;
 		case PGS_T_UINT64:
 			return &ffi_type_uint64;
+		case PGS_T_BOOL:
+			return &ffi_type_uint8;
 		case PGS_T_POINTER:
 		case PGS_T_DATUM:
 		case PGS_T_CSTRING:
@@ -149,9 +173,10 @@ pgs_ffi_type(PgsCType t)
 			return &ffi_type_pointer;
 		case PGS_T_DOUBLE:
 			return &ffi_type_double;
-		default:
-			return &ffi_type_void;
+		case PGS_T_FLOAT:
+			return &ffi_type_float;
 	}
+	return &ffi_type_void;
 }
 
 static int64_t
@@ -196,22 +221,47 @@ pgs_ffi_pack_arg(PgsCType t, Janet v, PgsVal *s)
 		case PGS_T_INT:
 			s->i32 = (int32_t) pgs_as_int(v);
 			break;
+		case PGS_T_UINT:
+			s->u32 = (uint32_t) pgs_as_int(v);
+			break;
+		case PGS_T_INT64:
+			s->i64 = pgs_as_int(v);
+			break;
 		case PGS_T_UINT64:
 			s->u64 = (uint64_t) pgs_as_int(v);
+			break;
+		case PGS_T_BOOL:
+			s->b = janet_truthy(v) ? 1 : 0;
 			break;
 		case PGS_T_POINTER:
 		case PGS_T_DATUM:
 			s->p = pgs_as_ptr(v);
 			break;
 		case PGS_T_CSTRING:
+			if (!janet_checktype(v, JANET_STRING))
+				janet_panicf("scalpel/call: :cstring arg must be a string, got %v", v);
 			s->p = (void *) janet_unwrap_string(v);
 			break;
+		case PGS_T_BYTES:
+			if (janet_checktype(v, JANET_BUFFER))
+				s->p = janet_unwrap_buffer(v)->data;
+			else if (janet_checktype(v, JANET_STRING))
+				s->p = (void *) janet_unwrap_string(v);
+			else
+				janet_panicf("scalpel/call: :bytes arg must be a string or buffer, got %v", v);
+			break;
 		case PGS_T_DOUBLE:
+			if (!janet_checktype(v, JANET_NUMBER))
+				janet_panicf("scalpel/call: :double arg must be a number, got %v", v);
 			s->d = janet_unwrap_number(v);
 			break;
-
-		default:
-			janet_panicf("scalpel/call: cannot pass type #%d", (int) t);
+		case PGS_T_FLOAT:
+			if (!janet_checktype(v, JANET_NUMBER))
+				janet_panicf("scalpel/call: :float arg must be a number, got %v", v);
+			s->f = (float) janet_unwrap_number(v);
+			break;
+		case PGS_T_VOID:
+			janet_panic("scalpel/call: :void is not a valid argument type");
 	}
 }
 
@@ -224,12 +274,17 @@ pgs_marshal_ret(PgsCType t, PgsRet *r)
 			return janet_wrap_nil();
 		case PGS_T_INT:
 			return janet_wrap_integer((int32_t) r->sarg);
+		case PGS_T_UINT:
+			return janet_wrap_number((double) (uint32_t) r->uarg);
 		case PGS_T_INT64:
 			return janet_wrap_s64((int64_t) r->sarg);
 		case PGS_T_UINT64:
 			return janet_wrap_u64((uint64_t) r->uarg);
+		case PGS_T_BOOL:
+			return janet_wrap_boolean((r->uarg & 0xff) != 0);
 		case PGS_T_POINTER:
 		case PGS_T_DATUM:
+		case PGS_T_BYTES:
 			return janet_wrap_pointer((void *) (uintptr_t) r->uarg);
 		case PGS_T_CSTRING:
 			{
@@ -237,10 +292,12 @@ pgs_marshal_ret(PgsCType t, PgsRet *r)
 
 				return cs ? janet_cstringv(cs) : janet_wrap_nil();
 			}
-
-		default:
-			return janet_wrap_nil();
+		case PGS_T_DOUBLE:
+			return janet_wrap_number(r->d);
+		case PGS_T_FLOAT:
+			return janet_wrap_number((double) r->f);
 	}
+	return janet_wrap_nil();
 }
 
 typedef struct
