@@ -13,7 +13,7 @@ SHLIB_LINK = -lm -ldw -lelf -lffi \
 
 $(JANET_DIR)/build/c/janet.o: CFLAGS += -w
 
-PG_CONFIG  = $(HOME)/pg19/install/bin/pg_config
+PG_CONFIG  = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
 include $(PGXS)
 

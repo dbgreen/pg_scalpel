@@ -34,12 +34,16 @@
 
 # --- NodeTag int -> name, straight from the build's generated header ----------
 (defn- po-load-nodetags []
-  (def path (string (or (os/getenv "PGJ_NODETAGS")
-                        "/home/bgreen/pg19/install/include/postgresql/server/nodes/nodetags.h")))
+  # NodeTag int -> name, parsed from the build's generated nodetags.h. Point
+  # PGJ_NODETAGS at it — e.g. "$(pg_config --includedir-server)/nodes/nodetags.h" —
+  # for readable node names; without it, paths show as "Tag#N" (still works).
+  (def path (os/getenv "PGJ_NODETAGS"))
   (def m @{})
-  (each line (string/split "\n" (slurp path))
-    (when-let [c (peg/match ~(* (any :s) "T_" (<- (some (+ :w "_"))) (any :s) "=" (any :s) (<- (some :d))) line)]
-      (put m (scan-number (get c 1)) (get c 0))))
+  (when path
+    (when-let [src (try (slurp path) ([_] nil))]
+      (each line (string/split "\n" src)
+        (when-let [c (peg/match ~(* (any :s) "T_" (<- (some (+ :w "_"))) (any :s) "=" (any :s) (<- (some :d))) line)]
+          (put m (scan-number (get c 1)) (get c 0))))))
   m)
 
 (defn- po-type-name [n] (or (get (PO-state :nodetags) n) (string "Tag#" n)))

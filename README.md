@@ -205,7 +205,10 @@ SELECT janet_eval($j$ (PO :disarm) $j$);
 ```
 
 `(PO :dump)` prints the candidates (with that seed; exact paths and costs move
-with the data and stats):
+with the data and stats). Readable node names need the server started with
+`PGJ_NODETAGS` pointing at your build's `nodetags.h`
+(`PGJ_NODETAGS=$(pg_config --includedir-server)/nodes/nodetags.h`); without it
+the types show as `Tag#N`:
 
 ```
 planner candidates: 24 paths over 4 rel(s)

@@ -80,8 +80,9 @@
   out)
 
 # ---- script loader -------------------------------------------------------
-# The pgjanet project root; scalpel-load resolves scripts relative to it so you can
-# pull in the fuzz engine and target scripts by short name after connecting.
+# scalpel-load resolves script paths relative to this root (default:
+# $HOME/pg_scalpel) so you can pull in example/instrument scripts by short name
+# after connecting. Override by redefining scalpel-root if your checkout is elsewhere.
 (def scalpel-root (string (os/getenv "HOME") "/pg_scalpel"))
 
 (defn scalpel-load
