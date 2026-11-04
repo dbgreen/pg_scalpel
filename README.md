@@ -172,6 +172,9 @@ On top of those is the prelude in `janet-lib/` — `hook-fn` and `unhook` by nam
 trio, `patch-jump`, `patch-return-int`. `(scalpel/syms "*" 50)` dumps backend
 symbols; the prelude you can just read in the source.
 
+Every function — signature, arguments, return, and the gotchas — is written up
+in [docs/reference.md](docs/reference.md).
+
 ## The sharp end
 
 `janet_eval` runs native code as whatever OS user Postgres runs as. Janet by
