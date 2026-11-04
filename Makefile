@@ -34,3 +34,9 @@ $(FUNCHOOK_DIR)/install/lib/libfunchook.a:
 	      -DCMAKE_INSTALL_PREFIX=$(abspath $(FUNCHOOK_DIR))/install
 	cmake --build $(FUNCHOOK_DIR)/build
 	cmake --install $(FUNCHOOK_DIR)/build
+
+# Regenerate the embedded Janet prelude from janet-lib/ sources.
+pgs_prelude.h: janet-lib/scalpel-lib.janet janet-lib/patch.janet tools/embed-prelude.janet
+	$(JANET_DIR)/build/janet tools/embed-prelude.janet
+
+pg_scalpel.o: pgs_prelude.h

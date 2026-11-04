@@ -19,6 +19,7 @@
 #include "pg_scalpel.h"
 #include "pgs_timer.h"
 #include "pgs_hook.h"
+#include "pgs_prelude.h"
 
 PG_MODULE_MAGIC;
 
@@ -1072,6 +1073,19 @@ pgs_vm_ensure(void)
 	janet_init();
 	pgs_env = janet_core_env(NULL);
 	janet_cfuns_prefix(pgs_env, "scalpel", pgs_cfuns);
+
+	/* Auto-load the Janet helper prelude (make-struct/pack-struct, hook-fn,
+	 * trace, patch helpers) so they are present in every REPL with no manual
+	 * load. Baked into pgs_prelude.h from janet-lib/ at build time. */
+	{
+		Janet		pres;
+
+		if (janet_dostring(pgs_env, pgs_prelude, "pg_scalpel/prelude", &pres) != 0)
+			ereport(ERROR,
+					(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+					 errmsg("pg_scalpel: prelude failed to load")));
+	}
+
 	started = true;
 	return pgs_env;
 }
