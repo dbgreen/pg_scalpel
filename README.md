@@ -181,7 +181,9 @@ work).
 `janet-lib/planner-observatory.janet` is a worked example: load it and it hooks
 `add_path`/`set_cheapest` to report every candidate path the planner considered
 for a query — type, costs, and which ones survived — decoded out of backend
-memory, no EXPLAIN parsing.
+memory, no EXPLAIN parsing. It's also what real use looks like — a `.janet`
+program kept in a file and pulled in with `scalpel-load`, rather than pasted into
+a query.
 
 ```sql
 SELECT janet_eval($j$ (def PO (scalpel-load "janet-lib/planner-observatory")) (PO :arm) $j$);
