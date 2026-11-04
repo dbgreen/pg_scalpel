@@ -1179,6 +1179,11 @@ pgs_eval(PG_FUNCTION_ARGS)
 	Janet		result;
 	const uint8_t *s;
 
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_scalpel: must be superuser")));
+
 	pgs_vm_ensure();
 	if (pgs_run_interruptible(src, "pg_scalpel", &result))
 		ereport(ERROR,
