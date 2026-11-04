@@ -178,6 +178,18 @@ of the tool: [docs/observation.md](docs/observation.md) (reading a live backend)
 and [docs/hooking.md](docs/hooking.md) (how `hook`/`hook-fn` and the trampoline
 work).
 
+`janet-lib/planner-observatory.janet` is a worked example: load it and it hooks
+`add_path`/`set_cheapest` to report every candidate path the planner considered
+for a query — type, costs, and which ones survived — decoded out of backend
+memory, no EXPLAIN parsing.
+
+```sql
+SELECT janet_eval($j$ (def PO (scalpel-load "janet-lib/planner-observatory")) (PO :arm) $j$);
+EXPLAIN (COSTS OFF) SELECT count(*) FROM t t1 JOIN t t2 USING (a) WHERE t1.b < 500;
+SELECT janet_eval($j$ (PO :dump) $j$);     -- the grouped, cost-sorted candidate report
+SELECT janet_eval($j$ (PO :disarm) $j$);
+```
+
 ## The sharp end
 
 `janet_eval` runs native code as whatever OS user Postgres runs as. Janet by
