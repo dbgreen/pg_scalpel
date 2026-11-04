@@ -5,6 +5,9 @@
 #include "access/xact.h"
 #include "utils/resowner.h"
 #include "dlfcn.h"
+#include <sys/mman.h>
+#include <errno.h>
+#include <string.h>
 #include "janet.h"
 #include <ffi.h>
 
@@ -452,6 +455,70 @@ jpgs_unhook(int32_t argc, Janet *argv)
 	return janet_wrap_nil();
 }
 
+static Janet
+jpgs_page_protect(int32_t argc, Janet *argv)
+{
+	void	   *addr;
+	size_t		len;
+	bool		writable;
+
+	janet_fixarity(argc, 3);
+	addr = pgs_as_ptr(argv[0]);
+	len = (size_t) janet_getnumber(argv, 1);
+	writable = janet_truthy(argv[2]);
+	{
+		uintptr_t	pg = (uintptr_t) sysconf(_SC_PAGESIZE);
+		uintptr_t	start = (uintptr_t) addr & ~(pg - 1);
+		uintptr_t	end = ((uintptr_t) addr + len + pg - 1) & ~(pg - 1);
+
+		if (mprotect((void *) start, (size_t) (end - start),
+					 writable ? (PROT_READ | PROT_WRITE | PROT_EXEC)
+					 : (PROT_READ | PROT_EXEC)) != 0)
+			janet_panicf("scalpel/page-protect: mprotect failed (%s)", strerror(errno));
+	}
+	return janet_wrap_nil();
+}
+
+static Janet
+jpgs_flush_icache(int32_t argc, Janet *argv)
+{
+	void	   *addr;
+	size_t		len;
+
+	janet_fixarity(argc, 2);
+	addr = pgs_as_ptr(argv[0]);
+	len = (size_t) janet_getnumber(argv, 1);
+#if defined(__aarch64__) || defined(__arm__)
+	__builtin___clear_cache((char *) addr, (char *) addr + len);
+#else
+	(void) addr;
+	(void) len;
+#endif
+	return janet_wrap_nil();
+}
+
+static Janet
+jpgs_image_range(int32_t argc, Janet *argv)
+{
+	const char *mod = NULL;
+
+	janet_arity(argc, 0, 1);
+	if (argc == 1 && !janet_checktype(argv[0], JANET_NIL))
+		mod = (const char *) janet_getcstring(argv, 0);
+	return pgs_image_range(mod);
+}
+
+static Janet
+jpgs_disasm(int32_t argc, Janet *argv)
+{
+	int			len = 16;
+
+	janet_arity(argc, 1, 2);
+	if (argc >= 2)
+		len = (int) janet_getinteger(argv, 1);
+	return pgs_disasm(pgs_as_ptr(argv[0]), len);
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -474,6 +541,14 @@ static const JanetReg pgs_cfuns[] = {
 	"(scalpel/hook target detour)\n\nInline-hook target to detour; returns a trampoline to the original."},
 	{"unhook", jpgs_unhook,
 	"(scalpel/unhook target)\n\nRemove a hook installed on target."},
+	{"page-protect", jpgs_page_protect,
+	"(scalpel/page-protect addr len writable?)\n\nMake a code range writable+exec or restore read+exec."},
+	{"flush-icache", jpgs_flush_icache,
+	"(scalpel/flush-icache addr len)\n\nFlush the instruction cache after writing code."},
+	{"image-range", jpgs_image_range,
+	"(scalpel/image-range &opt module)\n\nBase/size of a loaded module and its .text."},
+	{"disasm", jpgs_disasm,
+	"(scalpel/disasm addr &opt len)\n\nDisassemble live bytes at addr."},
 	{NULL, NULL, NULL}
 };
 

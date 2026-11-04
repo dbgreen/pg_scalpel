@@ -3,6 +3,8 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <elfutils/libdwfl.h>
+#include <gelf.h>
+#include <string.h>
 #include <dwarf.h>
 #include "janet.h"
 #include "pg_scalpel.h"
@@ -296,5 +298,73 @@ pgs_sym_signature(const char *name)
 	callv[0] = CK(retkw);
 	callv[1] = janet_wrap_tuple(janet_tuple_n(argkws->data, argkws->count));
 	janet_table_put(t, CK("call"), janet_wrap_tuple(janet_tuple_n(callv, 2)));
+	return janet_wrap_table(t);
+}
+
+typedef struct
+{
+	const char *want;
+	Dwfl_Module *mod;
+} PgsImgPick;
+
+static int
+img_pick_cb(Dwfl_Module *mod, void **u, const char *name,
+			Dwarf_Addr start, void *arg)
+{
+	PgsImgPick *p = (PgsImgPick *) arg;
+
+	(void) u;
+	(void) start;
+	if (p->want == NULL || (name != NULL && strstr(name, p->want) != NULL))
+	{
+		p->mod = mod;
+		return DWARF_CB_ABORT;
+	}
+	return DWARF_CB_OK;
+}
+
+Janet
+pgs_image_range(const char *module_or_null)
+{
+	PgsImgPick	pick = {module_or_null, NULL};
+	Dwarf_Addr	low = 0,
+				high = 0,
+				bias = 0;
+	Elf		   *elf;
+	Elf_Scn    *scn = NULL;
+	size_t		shstrndx;
+	JanetTable *t;
+
+	pgs_sym_init();
+	dwfl_getmodules(pgs_dwfl, img_pick_cb, &pick, 0);
+	if (pick.mod == NULL)
+		return janet_wrap_nil();
+	if (dwfl_module_info(pick.mod, NULL, &low, &high, NULL, NULL, NULL, NULL) == NULL)
+		return janet_wrap_nil();
+
+	t = janet_table(4);
+	janet_table_put(t, CK("base"), janet_wrap_pointer((void *) (uintptr_t) low));
+	janet_table_put(t, CK("size"), janet_wrap_number((double) (high - low)));
+
+	elf = dwfl_module_getelf(pick.mod, &bias);
+	if (elf != NULL && elf_getshdrstrndx(elf, &shstrndx) == 0)
+	{
+		while ((scn = elf_nextscn(elf, scn)) != NULL)
+		{
+			GElf_Shdr	sh;
+			const char *sn;
+
+			if (gelf_getshdr(scn, &sh) == NULL)
+				continue;
+			sn = elf_strptr(elf, shstrndx, sh.sh_name);
+			if (sn != NULL && strcmp(sn, ".text") == 0)
+			{
+				janet_table_put(t, CK("text"),
+								janet_wrap_pointer((void *) (uintptr_t) (sh.sh_addr + bias)));
+				janet_table_put(t, CK("textsize"), janet_wrap_number((double) sh.sh_size));
+				break;
+			}
+		}
+	}
 	return janet_wrap_table(t);
 }

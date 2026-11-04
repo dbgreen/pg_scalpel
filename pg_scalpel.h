@@ -21,5 +21,7 @@ extern void pgs_sym_init(void);
 extern Janet pgs_sym_resolve(const char *name);
 extern Janet pgs_sym_struct(const char *name);
 extern Janet pgs_sym_signature(const char *name);
+extern Janet pgs_image_range(const char *module_or_null);
+extern Janet pgs_disasm(void *addr, int len);
 
 #endif
