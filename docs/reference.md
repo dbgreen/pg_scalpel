@@ -75,6 +75,8 @@ text rendering.
 
 ## Changing behavior
 
+> How `hook`/`hook-fn` and the trampoline actually work: [hooking.md](hooking.md).
+
 **`(scalpel/hook target-addr detour-ptr)`** → `<trampoline>`
 Inline-hook `target-addr` to `detour-ptr`. Returns a trampoline — call it with the
 target's signature to run the original. Panics if already hooked or too short.

@@ -173,7 +173,8 @@ trio, `patch-jump`, `patch-return-int`. `(scalpel/syms "*" 50)` dumps backend
 symbols; the prelude you can just read in the source.
 
 Every function — signature, arguments, return, and the gotchas — is written up
-in [docs/reference.md](docs/reference.md).
+in [docs/reference.md](docs/reference.md), and [docs/hooking.md](docs/hooking.md)
+explains how `hook`/`hook-fn` and the trampoline work.
 
 ## The sharp end
 
