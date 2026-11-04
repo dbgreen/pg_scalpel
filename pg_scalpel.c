@@ -2,6 +2,9 @@
 #include "fmgr.h"
 #include "miscadmin.h"
 #include "utils/builtins.h"
+#include "utils/lsyscache.h"
+#include "libpq/pqformat.h"
+#include "lib/stringinfo.h"
 #include "access/xact.h"
 #include "utils/resowner.h"
 #include "dlfcn.h"
@@ -635,6 +638,117 @@ jpgs_backtrace(int32_t argc, Janet *argv)
 	return pgs_backtrace(maxf);
 }
 
+typedef struct
+{
+	const char *typname;
+	const char *bytes;
+	int			nbytes;
+	char	   *out;
+} PgsRecvCtx;
+
+static Datum
+thunk_recv(void *arg)
+{
+	PgsRecvCtx *c = (PgsRecvCtx *) arg;
+	Oid			typid;
+	Oid			recvfn,
+				ioparam,
+				outfn;
+	bool		isvarlena;
+	FmgrInfo	flinfo;
+	StringInfoData buf;
+	Datum		val;
+
+	typid = DatumGetObjectId(DirectFunctionCall1(regtypein,
+												 CStringGetDatum(c->typname)));
+	getTypeBinaryInputInfo(typid, &recvfn, &ioparam);
+	fmgr_info(recvfn, &flinfo);
+
+	initStringInfo(&buf);
+	appendBinaryStringInfo(&buf, c->bytes, c->nbytes);
+
+	val = ReceiveFunctionCall(&flinfo, &buf, ioparam, -1);
+	pq_getmsgend(&buf);
+
+	getTypeOutputInfo(typid, &outfn, &isvarlena);
+	c->out = OidOutputFunctionCall(outfn, val);
+	return (Datum) 0;
+}
+
+static Janet
+jpgs_recv(int32_t argc, Janet *argv)
+{
+	PgsRecvCtx	ctx;
+	PgsError	err;
+	Datum		dummy;
+	JanetByteView bytes;
+
+	janet_fixarity(argc, 2);
+	ctx.typname = (const char *) janet_getcstring(argv, 0);
+	bytes = janet_getbytes(argv, 1);
+	ctx.bytes = (const char *) bytes.bytes;
+	ctx.nbytes = bytes.len;
+	ctx.out = NULL;
+
+	if (pgs_guarded_call(thunk_recv, &ctx, &dummy, &err))
+		return pgs_ok(ctx.out ? janet_cstringv(ctx.out) : janet_wrap_nil());
+	return pgs_err_value(&err);
+}
+
+static Janet
+jpgs_getarg(int32_t argc, Janet *argv)
+{
+	FunctionCallInfo fcinfo;
+	int32_t		n;
+	PgsCType	t;
+	Datum		d;
+
+	janet_fixarity(argc, 3);
+	fcinfo = (FunctionCallInfo) pgs_as_ptr(argv[0]);
+	if (fcinfo == NULL)
+		janet_panic("scalpel/getarg: fcinfo is NULL");
+	n = (int32_t) pgs_as_int(argv[1]);
+	if (n < 0 || n >= fcinfo->nargs)
+		janet_panicf("scalpel/getarg: arg index %d out of range (nargs=%d)",
+					 (int) n, (int) fcinfo->nargs);
+	t = pgs_parse_type(argv[2]);
+
+	if (fcinfo->args[n].isnull)
+		return janet_wrap_nil();
+
+	d = fcinfo->args[n].value;
+	switch (t)
+	{
+		case PGS_T_INT:		return janet_wrap_integer((int32_t) DatumGetInt32(d));
+		case PGS_T_UINT:	return janet_wrap_number((double) DatumGetUInt32(d));
+		case PGS_T_INT64:	return janet_wrap_s64(DatumGetInt64(d));
+		case PGS_T_UINT64:
+		case PGS_T_DATUM:	return janet_wrap_u64((uint64_t) d);
+		case PGS_T_BOOL:	return janet_wrap_boolean(DatumGetBool(d));
+		case PGS_T_DOUBLE:	return janet_wrap_number(DatumGetFloat8(d));
+		case PGS_T_FLOAT:	return janet_wrap_number((double) DatumGetFloat4(d));
+		case PGS_T_POINTER:
+		case PGS_T_BYTES:	return janet_wrap_pointer((void *) (uintptr_t) d);
+		case PGS_T_CSTRING:	return janet_cstringv((const char *) DatumGetPointer(d));
+		case PGS_T_VOID:	janet_panic("scalpel/getarg: :void is not a valid type");
+	}
+	janet_panic("scalpel/getarg: unknown type");
+	return janet_wrap_nil();
+}
+
+static Janet
+jpgs_setresult_isnull(int32_t argc, Janet *argv)
+{
+	FunctionCallInfo fcinfo;
+
+	janet_fixarity(argc, 2);
+	fcinfo = (FunctionCallInfo) pgs_as_ptr(argv[0]);
+	if (fcinfo == NULL)
+		janet_panic("scalpel/setresult-isnull: fcinfo is NULL");
+	fcinfo->isnull = janet_truthy(argv[1]) ? true : false;
+	return janet_wrap_nil();
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -677,6 +791,12 @@ static const JanetReg pgs_cfuns[] = {
 	"(scalpel/sym-from-addr addr)\n\nNearest preceding symbol for a code address."},
 	{"backtrace", jpgs_backtrace,
 	"(scalpel/backtrace &opt maxframes)\n\nSymbolized C stack."},
+	{"recv", jpgs_recv,
+	"(scalpel/recv type-name bytes)\n\nDecode bytes via a type binary-input fn, guarded."},
+	{"getarg", jpgs_getarg,
+	"(scalpel/getarg fcinfo n type)\n\nRead the n-th fmgr arg from fcinfo as type."},
+	{"setresult-isnull", jpgs_setresult_isnull,
+	"(scalpel/setresult-isnull fcinfo bool)\n\nSet an fmgr replacement result to SQL NULL."},
 	{NULL, NULL, NULL}
 };
 
