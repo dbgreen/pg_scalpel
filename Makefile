@@ -4,10 +4,12 @@ FUNCHOOK_DIR = vendor/funchook
 MODULE_big = pg_scalpel
 EXTENSION  = pg_scalpel
 DATA       = pg_scalpel--0.1.sql
-OBJS       = pg_scalpel.o pgs_timer.o pgs_sym_linux.o $(JANET_DIR)/build/c/janet.o
-PG_CPPFLAGS  = -I$(JANET_DIR)/build
+OBJS       = pg_scalpel.o pgs_timer.o pgs_sym_linux.o pgs_hook_funchook.o $(JANET_DIR)/build/c/janet.o
+PG_CPPFLAGS  = -I$(JANET_DIR)/build -I$(FUNCHOOK_DIR)/install/include
 
-SHLIB_LINK = -lm -ldw -lelf -lffi
+SHLIB_LINK = -lm -ldw -lelf -lffi \
+  $(FUNCHOOK_DIR)/install/lib/libfunchook.a \
+  $(FUNCHOOK_DIR)/build/_deps/capstone-build/libcapstone.a
 
 $(JANET_DIR)/build/c/janet.o: CFLAGS += -w
 

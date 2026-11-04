@@ -10,6 +10,7 @@
 
 #include "pg_scalpel.h"
 #include "pgs_timer.h"
+#include "pgs_hook.h"
 
 PG_MODULE_MAGIC;
 
@@ -420,6 +421,37 @@ jpgs_closure(int32_t argc, Janet *argv)
 	return janet_wrap_pointer(code);
 }
 
+static Janet
+jpgs_hook(int32_t argc, Janet *argv)
+{
+	void	   *target;
+	void	   *detour;
+	void	   *tramp = NULL;
+	const char *err = NULL;
+
+	janet_fixarity(argc, 2);
+	target = pgs_as_ptr(argv[0]);
+	detour = pgs_as_ptr(argv[1]);
+	if (target == NULL || detour == NULL)
+		janet_panic("scalpel/hook: target and detour must be non-nil addresses");
+	if (!pgs_hook_install(target, detour, &tramp, &err))
+		janet_panicf("scalpel/hook: %s", err ? err : "install failed");
+	return janet_wrap_pointer(tramp);
+}
+
+static Janet
+jpgs_unhook(int32_t argc, Janet *argv)
+{
+	void	   *target;
+	const char *err = NULL;
+
+	janet_fixarity(argc, 1);
+	target = pgs_as_ptr(argv[0]);
+	if (!pgs_hook_remove(target, &err))
+		janet_panicf("scalpel/unhook: %s", err ? err : "remove failed");
+	return janet_wrap_nil();
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -438,6 +470,10 @@ static const JanetReg pgs_cfuns[] = {
 	"{:name :addr :ret :args :call} or nil, where :call is ready for scalpel/call."},
 	{"closure", jpgs_closure,
 	"(scalpel/closure ret [argtypes] fn)\n\nManufacture a C function pointer that runs the Janet fn."},
+	{"hook", jpgs_hook,
+	"(scalpel/hook target detour)\n\nInline-hook target to detour; returns a trampoline to the original."},
+	{"unhook", jpgs_unhook,
+	"(scalpel/unhook target)\n\nRemove a hook installed on target."},
 	{NULL, NULL, NULL}
 };
 
