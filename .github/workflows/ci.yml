@@ -35,17 +35,27 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ${{ env.PGINST }}
-          key: pg-${{ env.PG_REF }}-${{ runner.os }}-v1
+          key: pg-${{ env.PG_REF }}-${{ runner.os }}-rel-v1
 
-      - name: Build PostgreSQL from source (debug)
+      - name: Build PostgreSQL from source (-O2, split debug)
         if: steps.pgcache.outputs.cache-hit != 'true'
         run: |
           git clone --depth 1 --branch "$PG_REF" https://github.com/postgres/postgres.git pgsrc
           cd pgsrc
-          ./configure --prefix="$PGINST" --enable-debug --enable-cassert \
+          # Production shape: configure defaults to -O2; --enable-debug adds -g.
+          # No --enable-cassert (this is a release build).
+          ./configure --prefix="$PGINST" --enable-debug \
             --without-icu --without-readline --without-zlib
           make -j"$(nproc)"
           make install
+          # Split the debug info into a separate file next to the binary, found
+          # via .gnu_debuglink — exactly what pg_scalpel's DWARF reader must cope
+          # with in the field (the smoke test's struct-layout check exercises it).
+          cd "$PGINST/bin"
+          objcopy --only-keep-debug postgres postgres.debug
+          strip --strip-all postgres
+          objcopy --add-gnu-debuglink=postgres.debug postgres
+          chmod 0644 postgres.debug
 
       - name: Build and install pg_scalpel
         run: |
