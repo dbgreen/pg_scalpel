@@ -41,6 +41,20 @@ typedef union
 	float		f;
 } PgsRet;
 
+#define PGS_CLOSURE_MAXARGS 16
+
+typedef struct PgsClosure
+{
+	ffi_cif		cif;
+	ffi_closure *closure;
+	void	   *code;
+	JanetFunction *fn;
+	PgsCType	rtype;
+	int32_t		nargs;
+	PgsCType	atypes[PGS_CLOSURE_MAXARGS];
+	ffi_type   *ftypes[PGS_CLOSURE_MAXARGS];
+} PgsClosure;
+
 
 JanetTable *pgs_env = NULL;
 static bool started = false;
@@ -283,6 +297,129 @@ jpgs_sig(int32_t argc, Janet *argv)
 }
 
 
+static Janet
+pgs_unmarshal(PgsCType t, void *p)
+{
+	switch (t)
+	{
+		case PGS_T_INT:		return janet_wrap_integer(*(int32_t *) p);
+		case PGS_T_UINT:	return janet_wrap_number((double) *(uint32_t *) p);
+		case PGS_T_INT64:	return janet_wrap_s64(*(int64_t *) p);
+		case PGS_T_UINT64:	return janet_wrap_u64(*(uint64_t *) p);
+		case PGS_T_BOOL:	return janet_wrap_boolean(*(uint8_t *) p);
+		case PGS_T_POINTER:
+		case PGS_T_DATUM:
+		case PGS_T_CSTRING:
+		case PGS_T_BYTES:	return janet_wrap_pointer(*(void **) p);
+		case PGS_T_DOUBLE:	return janet_wrap_number(*(double *) p);
+		case PGS_T_FLOAT:	return janet_wrap_number((double) *(float *) p);
+		case PGS_T_VOID:	break;
+	}
+	return janet_wrap_nil();
+}
+
+static void
+pgs_store_ret(PgsCType t, Janet v, void *ret)
+{
+	switch (t)
+	{
+		case PGS_T_VOID:	break;
+		case PGS_T_INT:		*(ffi_sarg *) ret = (ffi_sarg) (int32_t) pgs_as_int(v); break;
+		case PGS_T_UINT:	*(ffi_arg *) ret = (ffi_arg) (uint32_t) pgs_as_int(v); break;
+		case PGS_T_INT64:	*(ffi_sarg *) ret = (ffi_sarg) pgs_as_int(v); break;
+		case PGS_T_UINT64:
+		case PGS_T_DATUM:	*(ffi_arg *) ret = (ffi_arg) (uint64_t) pgs_as_int(v); break;
+		case PGS_T_BOOL:	*(ffi_arg *) ret = janet_truthy(v) ? 1 : 0; break;
+		case PGS_T_POINTER:
+		case PGS_T_CSTRING:
+		case PGS_T_BYTES:	*(void **) ret = pgs_as_ptr(v); break;
+		case PGS_T_DOUBLE:	*(double *) ret = janet_unwrap_number(v); break;
+		case PGS_T_FLOAT:	*(float *) ret = (float) janet_unwrap_number(v); break;
+	}
+}
+
+static void
+pgs_closure_dispatch(ffi_cif *cif, void *ret, void **args, void *user)
+{
+	PgsClosure *c = (PgsClosure *) user;
+	Janet		jargs[PGS_CLOSURE_MAXARGS];
+	Janet		result = janet_wrap_nil();
+	JanetFiber *fiber = NULL;
+	JanetSignal sig;
+	int32_t		i;
+
+	(void) cif;
+	{
+		int			gclock = janet_gclock();
+
+		for (i = 0; i < c->nargs; i++)
+			jargs[i] = pgs_unmarshal(c->atypes[i], args[i]);
+		janet_gcunlock(gclock);
+	}
+
+	sig = janet_pcall(c->fn, c->nargs, jargs, &result, &fiber);
+	if (sig != JANET_SIGNAL_OK)
+	{
+		JanetString s = janet_formatc("%q", result);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_EXTERNAL_ROUTINE_EXCEPTION),
+				 errmsg("pg_scalpel closure: janet error: %s", (const char *) s)));
+	}
+	pgs_store_ret(c->rtype, result, ret);
+}
+
+static Janet
+jpgs_closure(int32_t argc, Janet *argv)
+{
+	PgsClosure *c;
+	JanetView	at;
+	int32_t		i;
+	void	   *code = NULL;
+
+	janet_fixarity(argc, 3);
+	if (!janet_checktype(argv[2], JANET_FUNCTION))
+		janet_panicf("scalpel/closure: third arg must be a function, got %v", argv[2]);
+
+	at = janet_getindexed(argv, 1);
+	if (at.len > PGS_CLOSURE_MAXARGS)
+		janet_panicf("scalpel/closure: too many arguments (max %d)", PGS_CLOSURE_MAXARGS);
+
+	c = (PgsClosure *) malloc(sizeof(PgsClosure));
+	if (c == NULL)
+		janet_panic("scalpel/closure: out of memory");
+	c->fn = janet_unwrap_function(argv[2]);
+	c->rtype = pgs_parse_type(argv[0]);
+	c->nargs = at.len;
+	for (i = 0; i < at.len; i++)
+	{
+		c->atypes[i] = pgs_parse_type(at.items[i]);
+		c->ftypes[i] = pgs_ffi_type(c->atypes[i]);
+	}
+
+	if (ffi_prep_cif(&c->cif, FFI_DEFAULT_ABI, (unsigned) c->nargs,
+					 pgs_ffi_type(c->rtype), c->ftypes) != FFI_OK)
+	{
+		free(c);
+		janet_panic("scalpel/closure: ffi_prep_cif failed");
+	}
+	c->closure = (ffi_closure *) ffi_closure_alloc(sizeof(ffi_closure), &code);
+	if (c->closure == NULL)
+	{
+		free(c);
+		janet_panic("scalpel/closure: ffi_closure_alloc failed");
+	}
+	if (ffi_prep_closure_loc(c->closure, &c->cif, pgs_closure_dispatch, c, code) != FFI_OK)
+	{
+		ffi_closure_free(c->closure);
+		free(c);
+		janet_panic("scalpel/closure: ffi_prep_closure_loc failed");
+	}
+	c->code = code;
+	janet_gcroot(janet_wrap_function(c->fn));
+	return janet_wrap_pointer(code);
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -299,6 +436,8 @@ static const JanetReg pgs_cfuns[] = {
 	{"sig", jpgs_sig,
 		"(scalpel/sig name)\n\nRead a function's signature from DWARF. Returns "
 	"{:name :addr :ret :args :call} or nil, where :call is ready for scalpel/call."},
+	{"closure", jpgs_closure,
+	"(scalpel/closure ret [argtypes] fn)\n\nManufacture a C function pointer that runs the Janet fn."},
 	{NULL, NULL, NULL}
 };
 
