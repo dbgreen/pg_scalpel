@@ -4,9 +4,10 @@ FUNCHOOK_DIR = vendor/funchook
 MODULE_big = pg_scalpel
 EXTENSION  = pg_scalpel
 DATA       = pg_scalpel--0.1.sql
-OBJS       = pg_scalpel.o pgs_timer.o $(JANET_DIR)/build/c/janet.o
+OBJS       = pg_scalpel.o pgs_timer.o pgs_sym_linux.o $(JANET_DIR)/build/c/janet.o
 PG_CPPFLAGS  = -I$(JANET_DIR)/build
-SHLIB_LINK = -lm
+
+SHLIB_LINK = -lm -ldw -lelf
 
 $(JANET_DIR)/build/c/janet.o: CFLAGS += -w
 
