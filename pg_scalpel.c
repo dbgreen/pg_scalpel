@@ -52,8 +52,6 @@ static const JanetReg pgs_cfuns[] = {
 	"(scalpel/parse-int str)\n\nParse str as an int4, the way '...'::int does."},
 	{"resolve", jpgs_resolve,
 	"(scalpel/resolve name)\n\nAddress of symbol name, or nil."},
-	{"resolve", jpgs_resolve,
-	"(scalpel/resolve name)\n\nAddress of symbol name, or nil."},
 	{NULL, NULL, NULL}
 };
 
