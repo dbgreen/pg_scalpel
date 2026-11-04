@@ -6,11 +6,41 @@
 #include "utils/resowner.h"
 #include "dlfcn.h"
 #include "janet.h"
+#include <ffi.h>
 
 #include "pg_scalpel.h"
 #include "pgs_timer.h"
 
 PG_MODULE_MAGIC;
+
+typedef enum
+{
+	PGS_T_VOID, PGS_T_INT, PGS_T_UINT, PGS_T_INT64, PGS_T_UINT64,
+	PGS_T_BOOL, PGS_T_POINTER, PGS_T_DATUM, PGS_T_CSTRING,
+	PGS_T_BYTES, PGS_T_DOUBLE, PGS_T_FLOAT
+} PgsCType;
+
+typedef union
+{
+	int32_t		i32;
+	uint32_t	u32;
+	int64_t		i64;
+	uint64_t	u64;
+	bool		b;
+	void	   *p;
+	double		d;
+	float		f;
+} PgsVal;
+
+typedef union
+{
+	ffi_arg		uarg;
+	ffi_sarg	sarg;
+	void	   *p;
+	double		d;
+	float		f;
+} PgsRet;
+
 
 JanetTable *pgs_env = NULL;
 static bool started = false;
@@ -18,8 +48,8 @@ static bool started = false;
 static Janet
 jpgs_struct(int32_t argc, Janet *argv)
 {
-    janet_fixarity(argc, 1);
-    return pgs_sym_struct((const char *) janet_getcstring(argv, 0));
+	janet_fixarity(argc, 1);
+	return pgs_sym_struct((const char *) janet_getcstring(argv, 0));
 }
 
 static Janet
@@ -52,6 +82,199 @@ jpgs_parse_int(int32_t argc, Janet *argv)
 		return pgs_ok(janet_wrap_integer(DatumGetInt32(result)));
 	return pgs_err_value(&err);
 }
+static PgsCType
+pgs_parse_type(Janet v)
+{
+	const uint8_t *k = janet_unwrap_keyword(v);
+
+	if (!janet_cstrcmp(k, "void"))
+		return PGS_T_VOID;
+	if (!janet_cstrcmp(k, "int"))
+		return PGS_T_INT;
+	if (!janet_cstrcmp(k, "uint64"))
+		return PGS_T_UINT64;
+	if (!janet_cstrcmp(k, "pointer") || !janet_cstrcmp(k, "ptr"))
+		return PGS_T_POINTER;
+	if (!janet_cstrcmp(k, "cstring"))
+		return PGS_T_CSTRING;
+	janet_panicf("scalpel/call: unknown type :%s", (const char *) k);
+}
+
+static ffi_type *
+pgs_ffi_type(PgsCType t)
+{
+	switch (t)
+	{
+		case PGS_T_VOID:
+			return &ffi_type_void;
+		case PGS_T_INT:
+			return &ffi_type_sint32;
+		case PGS_T_UINT64:
+			return &ffi_type_uint64;
+		case PGS_T_POINTER:
+		case PGS_T_DATUM:
+		case PGS_T_CSTRING:
+		case PGS_T_BYTES:
+			return &ffi_type_pointer;
+		case PGS_T_DOUBLE:
+			return &ffi_type_double;
+		default:
+			return &ffi_type_void;
+	}
+}
+
+static int64_t
+pgs_as_int(Janet v)
+{
+	JanetIntType it = janet_is_int(v);
+
+	if (it == JANET_INT_S64)
+		return janet_unwrap_s64(v);
+	if (it == JANET_INT_U64)
+		return (int64_t) janet_unwrap_u64(v);
+	if (janet_checktype(v, JANET_NUMBER))
+		return (int64_t) janet_unwrap_number(v);
+	if (janet_checktype(v, JANET_POINTER))
+		return (int64_t) (intptr_t) janet_unwrap_pointer(v);
+	janet_panicf("scalpel/call: expected number, got %v", v);
+}
+
+static void *
+pgs_as_ptr(Janet v)
+{
+	JanetIntType it = janet_is_int(v);
+
+	if (janet_checktype(v, JANET_POINTER))
+		return janet_unwrap_pointer(v);
+	if (janet_checktype(v, JANET_NIL))
+		return NULL;
+	if (it == JANET_INT_U64)
+		return (void *) (uintptr_t) janet_unwrap_u64(v);
+	if (it == JANET_INT_S64)
+		return (void *) (uintptr_t) janet_unwrap_s64(v);
+	if (janet_checktype(v, JANET_NUMBER))
+		return (void *) (uintptr_t) janet_unwrap_number(v);
+	janet_panicf("scalpel/call: expected pointer/number, got %v", v);
+}
+
+static void
+pgs_ffi_pack_arg(PgsCType t, Janet v, PgsVal *s)
+{
+	switch (t)
+	{
+		case PGS_T_INT:
+			s->i32 = (int32_t) pgs_as_int(v);
+			break;
+		case PGS_T_UINT64:
+			s->u64 = (uint64_t) pgs_as_int(v);
+			break;
+		case PGS_T_POINTER:
+		case PGS_T_DATUM:
+			s->p = pgs_as_ptr(v);
+			break;
+		case PGS_T_CSTRING:
+			s->p = (void *) janet_unwrap_string(v);
+			break;
+		case PGS_T_DOUBLE:
+			s->d = janet_unwrap_number(v);
+			break;
+
+		default:
+			janet_panicf("scalpel/call: cannot pass type #%d", (int) t);
+	}
+}
+
+static Janet
+pgs_marshal_ret(PgsCType t, PgsRet *r)
+{
+	switch (t)
+	{
+		case PGS_T_VOID:
+			return janet_wrap_nil();
+		case PGS_T_INT:
+			return janet_wrap_integer((int32_t) r->sarg);
+		case PGS_T_INT64:
+			return janet_wrap_s64((int64_t) r->sarg);
+		case PGS_T_UINT64:
+			return janet_wrap_u64((uint64_t) r->uarg);
+		case PGS_T_POINTER:
+		case PGS_T_DATUM:
+			return janet_wrap_pointer((void *) (uintptr_t) r->uarg);
+		case PGS_T_CSTRING:
+			{
+				char	   *cs = (char *) (uintptr_t) r->uarg;
+
+				return cs ? janet_cstringv(cs) : janet_wrap_nil();
+			}
+
+		default:
+			return janet_wrap_nil();
+	}
+}
+
+typedef struct
+{
+	ffi_cif    *cif;
+	void		(*fn) (void);
+	void	  **avalues;
+	PgsRet	   *ret;
+} PgsCallCtx;
+
+static Datum
+thunk_ffi_call(void *arg)
+{
+	PgsCallCtx *c = (PgsCallCtx *) arg;
+
+	ffi_call(c->cif, c->fn, c->ret, c->avalues);
+	return (Datum) 0;
+}
+
+static Janet
+jpgs_call(int32_t argc, Janet *argv)
+{
+	void	   *fnaddr = pgs_as_ptr(argv[0]);
+	PgsCType	rtype = pgs_parse_type(argv[1]);
+	JanetView	at = janet_getindexed(argv, 2);
+	int32_t		nargs = at.len;
+
+	PgsCType   *etypes = janet_smalloc(sizeof(*etypes) * nargs);
+	ffi_type  **ftypes = janet_smalloc(sizeof(*ftypes) * nargs);
+	void	  **avalues = janet_smalloc(sizeof(*avalues) * nargs);
+	PgsVal	   *slots = janet_smalloc(sizeof(*slots) * nargs);
+	ffi_cif		cif;
+	PgsRet		ret;
+	PgsCallCtx	ctx;
+	PgsError	err;
+	Datum		dummy;
+	bool		ok;
+
+	for (int32_t i = 0; i < nargs; i++)
+	{
+		etypes[i] = pgs_parse_type(at.items[i]);
+		ftypes[i] = pgs_ffi_type(etypes[i]);
+		pgs_ffi_pack_arg(etypes[i], argv[3 + i], &slots[i]);
+		avalues[i] = &slots[i];
+	}
+
+	if (ffi_prep_cif(&cif, FFI_DEFAULT_ABI, nargs, pgs_ffi_type(rtype), ftypes) != FFI_OK)
+		janet_panic("scalpel/call: ffi_prep_cif failed");
+
+	memset(&ret, 0, sizeof(ret));
+	ctx.cif = &cif;
+	ctx.fn = (void (*) (void)) fnaddr;
+	ctx.avalues = avalues;
+	ctx.ret = &ret;
+
+	ok = pgs_guarded_call(thunk_ffi_call, &ctx, &dummy, &err);
+
+	janet_sfree(etypes);
+	janet_sfree(ftypes);
+	janet_sfree(avalues);
+	janet_sfree(slots);
+
+	return ok ? pgs_ok(pgs_marshal_ret(rtype, &ret)) : pgs_err_value(&err);
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -60,9 +283,11 @@ static const JanetReg pgs_cfuns[] = {
 	{"resolve", jpgs_resolve,
 	"(scalpel/resolve name)\n\nAddress of symbol name, or nil."},
 	{"struct", jpgs_struct,
-         "(scalpel/struct name)\n\nDecode a struct's layout from DWARF (a tag name or a "
-         "typedef that resolves to one). Returns {:name :size :fields [{:name :offset "
-         ":size :call} ...]} or nil."},
+		"(scalpel/struct name)\n\nDecode a struct's layout from DWARF (a tag name or a "
+		"typedef that resolves to one). Returns {:name :size :fields [{:name :offset "
+	":size :call} ...]} or nil."},
+	{"call", jpgs_call,
+	"(scalpel/call addr ret [argtypes] args...)\n\nCall the C function at addr via libffi."},
 	{NULL, NULL, NULL}
 };
 
@@ -228,8 +453,6 @@ pgs_run_interruptible(const char *src, const char *where, Janet *out)
 	janet_parser_deinit(&parser);
 	return ok ? 0 : 1;
 }
-
-
 
 PG_FUNCTION_INFO_V1(pgs_eval);
 
