@@ -17,6 +17,9 @@ Janet string ↔ `char *`; `:bytes` is the data pointer of a string (in) or buff
 
 ## Symbols & introspection
 
+> Reading a live backend — binary introspection, symbolizing, disasm, scan,
+> trace: [observation.md](observation.md).
+
 **`(scalpel/resolve name)`** → `<pointer>` | nil
 Address of a symbol. Exported names resolve without debug info; statics need it.
 
