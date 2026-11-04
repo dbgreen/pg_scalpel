@@ -185,6 +185,18 @@ memory, no EXPLAIN parsing. It's also what real use looks like — a `.janet`
 program kept in a file and pulled in with `scalpel-load`, rather than pasted into
 a query.
 
+First give the planner something to choose between — a table with rows, an index,
+and stats:
+
+```sql
+CREATE TABLE t(a int, b int);
+INSERT INTO t SELECT g % 100, g FROM generate_series(1, 5000) g;
+CREATE INDEX ON t(a);
+ANALYZE t;
+```
+
+Then load the observatory, arm it, run a query, and dump:
+
 ```sql
 SELECT janet_eval($j$ (def PO (scalpel-load "janet-lib/planner-observatory")) (PO :arm) $j$);
 EXPLAIN (COSTS OFF) SELECT count(*) FROM t t1 JOIN t t2 USING (a) WHERE t1.b < 500;
@@ -192,8 +204,8 @@ SELECT janet_eval($j$ (PO :dump) $j$);     -- the grouped, cost-sorted candidate
 SELECT janet_eval($j$ (PO :disarm) $j$);
 ```
 
-`(PO :dump)` prints the candidates — here on a 5000-row, indexed, analyzed `t`
-(exact paths and costs move with the data and stats):
+`(PO :dump)` prints the candidates (with that seed; exact paths and costs move
+with the data and stats):
 
 ```
 planner candidates: 24 paths over 4 rel(s)
