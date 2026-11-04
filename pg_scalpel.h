@@ -19,5 +19,6 @@ extern int	pgs_run_interruptible(const char *src, const char *where, Janet *out)
 
 extern void pgs_sym_init(void);
 extern Janet pgs_sym_resolve(const char *name);
+extern Janet pgs_sym_struct(const char *name);
 
 #endif

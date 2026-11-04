@@ -16,6 +16,13 @@ JanetTable *pgs_env = NULL;
 static bool started = false;
 
 static Janet
+jpgs_struct(int32_t argc, Janet *argv)
+{
+    janet_fixarity(argc, 1);
+    return pgs_sym_struct((const char *) janet_getcstring(argv, 0));
+}
+
+static Janet
 jpgs_resolve(int32_t argc, Janet *argv)
 {
 	janet_fixarity(argc, 1);
@@ -52,6 +59,10 @@ static const JanetReg pgs_cfuns[] = {
 	"(scalpel/parse-int str)\n\nParse str as an int4, the way '...'::int does."},
 	{"resolve", jpgs_resolve,
 	"(scalpel/resolve name)\n\nAddress of symbol name, or nil."},
+	{"struct", jpgs_struct,
+         "(scalpel/struct name)\n\nDecode a struct's layout from DWARF (a tag name or a "
+         "typedef that resolves to one). Returns {:name :size :fields [{:name :offset "
+         ":size :call} ...]} or nil."},
 	{NULL, NULL, NULL}
 };
 
