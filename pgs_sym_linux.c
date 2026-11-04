@@ -256,3 +256,45 @@ pgs_sym_struct(const char *name)
 }
 
 
+
+Janet
+pgs_sym_signature(const char *name)
+{
+	Dwarf_Die	fn;
+	Dwarf_Die	rt;
+	Dwarf_Die	child;
+	const char *retkw;
+	JanetArray *argkws;
+	JanetTable *t;
+	Janet		callv[2];
+
+	if (!find_die_by_name(DW_TAG_subprogram, name, &fn))
+		return janet_wrap_nil();
+
+	retkw = die_type(&fn, &rt) ? dw_call_kw(&rt) : "void";
+
+	argkws = janet_array(0);
+	if (dwarf_child(&fn, &child) == 0)
+	{
+		do
+		{
+			Dwarf_Die	pt;
+
+			if (dwarf_tag(&child) != DW_TAG_formal_parameter)
+				continue;
+			janet_array_push(argkws,
+							 CK(die_type(&child, &pt) ? dw_call_kw(&pt) : "pointer"));
+		} while (dwarf_siblingof(&child, &child) == 0);
+	}
+
+	t = janet_table(4);
+	janet_table_put(t, CK("name"), janet_cstringv(name));
+	janet_table_put(t, CK("addr"), pgs_sym_resolve(name));
+	janet_table_put(t, CK("ret"), CK(retkw));
+	janet_table_put(t, CK("args"), janet_wrap_array(argkws));
+
+	callv[0] = CK(retkw);
+	callv[1] = janet_wrap_tuple(janet_tuple_n(argkws->data, argkws->count));
+	janet_table_put(t, CK("call"), janet_wrap_tuple(janet_tuple_n(callv, 2)));
+	return janet_wrap_table(t);
+}

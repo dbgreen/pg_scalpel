@@ -275,6 +275,14 @@ jpgs_call(int32_t argc, Janet *argv)
 	return ok ? pgs_ok(pgs_marshal_ret(rtype, &ret)) : pgs_err_value(&err);
 }
 
+static Janet
+jpgs_sig(int32_t argc, Janet *argv)
+{
+	janet_fixarity(argc, 1);
+	return pgs_sym_signature((const char *) janet_getcstring(argv, 0));
+}
+
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -288,6 +296,9 @@ static const JanetReg pgs_cfuns[] = {
 	":size :call} ...]} or nil."},
 	{"call", jpgs_call,
 	"(scalpel/call addr ret [argtypes] args...)\n\nCall the C function at addr via libffi."},
+	{"sig", jpgs_sig,
+		"(scalpel/sig name)\n\nRead a function's signature from DWARF. Returns "
+	"{:name :addr :ret :args :call} or nil, where :call is ready for scalpel/call."},
 	{NULL, NULL, NULL}
 };
 
