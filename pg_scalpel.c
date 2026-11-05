@@ -1250,3 +1250,97 @@ pgs_eval(PG_FUNCTION_ARGS)
 	s = janet_to_string(result);
 	return PointerGetDatum(cstring_to_text_with_len((const char *) s, janet_string_length(s)));
 }
+
+/* ------------------------------------------------------------------ */
+/* REPL over a per-backend Unix-domain socket (pgs_transport_linux.c).  */
+/* ------------------------------------------------------------------ */
+
+/*
+ * Serve an interactive Janet REPL to one client over the transport seam (a
+ * per-pid Unix socket). Blocks the calling backend until the client sends
+ * ":quit" or disconnects. Each line is evaluated on this backend thread against
+ * the connection's VM, so anything installed — hooks, patches, an armed row
+ * filter — persists after the REPL returns. The socket waits are
+ * PG-interruptible, so the parked backend still honors cancel/terminate/shutdown.
+ *
+ * LIMITATION (v1): a runaway Janet form (an infinite loop, say) is only
+ * interrupted at the socket waits, not mid-eval; disconnect or terminate the
+ * backend to recover.
+ */
+static void
+scalpel_repl_serve(void)
+{
+	PgsConn    *c;
+	char	   *endpoint = NULL;
+	char	   *buf = palloc(65536);
+	char		greeting[128];
+
+	c = pgs_transport_accept(&endpoint);
+	if (c == NULL)
+		return;
+
+	ereport(INFO,
+			(errmsg("pg_scalpel REPL listening on %s (pid %d)",
+					endpoint ? endpoint : "?", (int) MyProcPid)));
+
+	PG_TRY();
+	{
+		int			n;
+
+		snprintf(greeting, sizeof(greeting),
+				 "pg_scalpel REPL - Janet %s in backend pid %d\nscalpel> ",
+				 JANET_VERSION, (int) MyProcPid);
+		pgs_transport_write(c, greeting, (int) strlen(greeting));
+
+		while ((n = pgs_transport_read(c, buf, 65535)) > 0)
+		{
+			Janet		out = janet_wrap_nil();
+			const char *reply;
+			char	   *s = buf;
+
+			buf[n] = '\0';
+			while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
+							 buf[n - 1] == ' ' || buf[n - 1] == '\t'))
+				buf[--n] = '\0';
+			while (*s == ' ' || *s == '\t')
+				s++;
+
+			if (*s == '\0')
+			{
+				pgs_transport_write(c, "scalpel> ", 9);
+				continue;
+			}
+			if (strcmp(s, ":quit") == 0)
+				break;
+
+			if (pgs_run_interruptible(s, "scalpel-repl", &out) == 0)
+				reply = (const char *) janet_formatc("%q\nscalpel> ", out);
+			else
+				reply = (const char *) janet_formatc("error: %s\nscalpel> ",
+													 (const char *) janet_to_string(out));
+			pgs_transport_write(c, reply, (int) strlen(reply));
+		}
+	}
+	PG_CATCH();
+	{
+		pgs_transport_close(c);
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
+
+	pgs_transport_close(c);
+}
+
+PG_FUNCTION_INFO_V1(scalpel_repl);
+
+Datum
+scalpel_repl(PG_FUNCTION_ARGS)
+{
+	if (!superuser())
+		ereport(ERROR,
+				(errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+				 errmsg("pg_scalpel: must be superuser")));
+	pgs_vm_ensure();
+	scalpel_repl_serve();
+	PG_RETURN_INT32(0);
+}

@@ -27,4 +27,11 @@ extern Janet pgs_sym_enumerate(const char *pattern, int limit);
 extern Janet pgs_sym_from_addr(void *addr);
 extern Janet pgs_backtrace(int maxframes);
 
+/* REPL transport (pgs_transport_linux.c): a per-pid Unix-domain socket. */
+typedef struct PgsConn PgsConn;
+extern PgsConn *pgs_transport_accept(char **endpoint_out);
+extern int	pgs_transport_read(PgsConn *c, char *buf, int cap);
+extern void pgs_transport_write(PgsConn *c, const char *buf, int len);
+extern void pgs_transport_close(PgsConn *c);
+
 #endif
