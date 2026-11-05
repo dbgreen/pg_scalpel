@@ -6,6 +6,7 @@
 #include "libpq/pqformat.h"
 #include "lib/stringinfo.h"
 #include "executor/executor.h"
+#include "executor/spi.h"
 #include "catalog/pg_type.h"
 #include "access/xact.h"
 #include "utils/resowner.h"
@@ -998,6 +999,82 @@ jscalpel_intercept_rows(int32_t argc, Janet *argv)
 	return janet_wrap_nil();
 }
 
+/*
+ * scalpel/sql — run SQL in this backend via SPI, guarded. SPI is how a C
+ * function already inside query execution runs more SQL (the same mechanism the
+ * PLs use), so this works from janet_eval and from a REPL alike: the query runs
+ * in THIS process, so a hook you installed a moment ago fires when it executes.
+ * The guard (a subtransaction + PG_TRY, same as scalpel/call) turns a SQL error
+ * into (:error {...}) instead of unwinding the caller.
+ */
+typedef struct
+{
+	const char *query;
+	long		limit;
+	Janet		out;
+} PgsSqlCtx;
+
+static Datum
+thunk_sql(void *arg)
+{
+	PgsSqlCtx  *c = (PgsSqlCtx *) arg;
+
+	if (SPI_connect() != SPI_OK_CONNECT)
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("pg_scalpel: SPI_connect failed")));
+
+	(void) SPI_execute(c->query, false, c->limit);
+
+	if (SPI_tuptable != NULL)
+	{
+		SPITupleTable *tt = SPI_tuptable;
+		TupleDesc	td = tt->tupdesc;
+		JanetArray *rows = janet_array((int32_t) SPI_processed);
+		uint64		r;
+
+		for (r = 0; r < SPI_processed; r++)
+		{
+			HeapTuple	tup = tt->vals[r];
+			JanetTable *row = janet_table(td->natts);
+			int			col;
+
+			for (col = 1; col <= td->natts; col++)
+			{
+				char	   *name = SPI_fname(td, col);
+				char	   *val = SPI_getvalue(tup, td, col);
+
+				janet_table_put(row, janet_ckeywordv(name),
+								val ? janet_cstringv(val) : janet_wrap_nil());
+			}
+			janet_array_push(rows, janet_wrap_table(row));
+		}
+		c->out = janet_wrap_array(rows);
+	}
+	else
+		c->out = janet_wrap_integer((int32_t) SPI_processed);
+
+	SPI_finish();
+	return (Datum) 0;
+}
+
+static Janet
+jpgs_sql(int32_t argc, Janet *argv)
+{
+	PgsSqlCtx	ctx;
+	Datum		dummy;
+	PgsError	err;
+
+	janet_arity(argc, 1, 2);
+	ctx.query = (const char *) janet_getcstring(argv, 0);
+	ctx.limit = (argc >= 2) ? (long) janet_getinteger(argv, 1) : 0;
+	ctx.out = janet_wrap_nil();
+
+	if (pgs_guarded_call(thunk_sql, &ctx, &dummy, &err))
+		return pgs_ok(ctx.out);
+	return pgs_err_value(&err);
+}
+
 static const JanetReg pgs_cfuns[] = {
 	{"backend-pid", jpgs_backend_pid,
 	"(scalpel/backend-pid)\n\nThe process id of the backend running this code."},
@@ -1011,6 +1088,10 @@ static const JanetReg pgs_cfuns[] = {
 	":size :call} ...]} or nil."},
 	{"call", jpgs_call,
 	"(scalpel/call addr ret [argtypes] args...)\n\nCall the C function at addr via libffi."},
+	{"sql", jpgs_sql,
+		"(scalpel/sql query &opt limit)\n\nRun SQL in this backend via SPI, guarded. "
+		"Returns (:ok @[{:col val ...} ...]) with values as text for a result set, "
+		"(:ok n) rows-processed otherwise, or (:error {...}) on a SQL error."},
 	{"sig", jpgs_sig,
 		"(scalpel/sig name)\n\nRead a function's signature from DWARF. Returns "
 	"{:name :addr :ret :args :call} or nil, where :call is ready for scalpel/call."},
@@ -1295,8 +1376,10 @@ scalpel_repl_serve(void)
 		while ((n = pgs_transport_read(c, buf, 65535)) > 0)
 		{
 			Janet		out = janet_wrap_nil();
-			const char *reply;
 			char	   *s = buf;
+			Janet		outkw = janet_ckeywordv("out");
+			JanetBuffer *cap;
+			int			rc;
 
 			buf[n] = '\0';
 			while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
@@ -1313,12 +1396,47 @@ scalpel_repl_serve(void)
 			if (strcmp(s, ":quit") == 0)
 				break;
 
-			if (pgs_run_interruptible(s, "scalpel-repl", &out) == 0)
-				reply = (const char *) janet_formatc("%q\nscalpel> ", out);
+			/*
+			 * Capture whatever the form prints. Janet's print/prin/pp write to
+			 * (dyn :out); the eval fiber uses pgs_env for dynamic bindings, so
+			 * binding :out to a buffer here routes that output to us instead of
+			 * the backend's stdout. We ship it to the client before the value.
+			 */
+			cap = janet_buffer(0);
+			janet_table_put(pgs_env, outkw, janet_wrap_buffer(cap));
+			rc = pgs_run_interruptible(s, "scalpel-repl", &out);
+			if (cap->count > 0)
+				pgs_transport_write(c, (const char *) cap->data, cap->count);
+			janet_table_put(pgs_env, outkw, janet_wrap_nil());
+
+			if (rc != 0)
+			{
+				const char *reply = (const char *) janet_formatc(
+					"error: %s\nscalpel> ", (const char *) janet_to_string(out));
+
+				pgs_transport_write(c, reply, (int) strlen(reply));
+			}
+			else if (janet_checktype(out, JANET_STRING))
+			{
+				/* a formatted report (the observatory dump, say) prints raw */
+				JanetString sv = janet_unwrap_string(out);
+
+				pgs_transport_write(c, (const char *) sv, (int) janet_string_length(sv));
+				pgs_transport_write(c, "\nscalpel> ", 10);
+			}
+			else if (janet_checktype(out, JANET_BUFFER))
+			{
+				JanetBuffer *bv = janet_unwrap_buffer(out);
+
+				pgs_transport_write(c, (const char *) bv->data, (int) bv->count);
+				pgs_transport_write(c, "\nscalpel> ", 10);
+			}
 			else
-				reply = (const char *) janet_formatc("error: %s\nscalpel> ",
-													 (const char *) janet_to_string(out));
-			pgs_transport_write(c, reply, (int) strlen(reply));
+			{
+				const char *reply = (const char *) janet_formatc("%q\nscalpel> ", out);
+
+				pgs_transport_write(c, reply, (int) strlen(reply));
+			}
 		}
 	}
 	PG_CATCH();

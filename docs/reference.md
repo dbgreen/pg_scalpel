@@ -62,6 +62,14 @@ Unguarded `call`. Only for leaf functions that cannot `ereport`.
 A C function pointer whose body runs `fn`. Lives for the backend's life (never
 freed). Use it as a hook detour or any C callback.
 
+**`(scalpel/sql query &opt limit)`** → `(:ok rows)` | `(:ok n)` | `(:error {...})`
+Run SQL in this backend via SPI (the mechanism the PLs use), guarded like `call`.
+A result set returns `rows` = `@[{:col "val" ...} ...]` with values as text
+(`limit` caps rows, 0 = all); other commands return `n` rows processed. Because
+it runs in this process, a hook you installed fires when the query executes. It
+runs inside the caller's transaction — statement execution, no commit/rollback of
+the outer transaction from here.
+
 ## fmgr replacement
 
 A closure standing in for a builtin gets one `:pointer` — the `FunctionCallInfo`.

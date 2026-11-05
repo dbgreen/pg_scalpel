@@ -163,33 +163,33 @@ prints the per-pid socket it's listening on:
 
 ```sql
 SELECT scalpel_repl();
---  INFO:  pg_scalpel REPL listening on /tmp/pg_scalpel-679278.sock (pid 679278)
+--  INFO:  pg_scalpel REPL listening on /tmp/pg_scalpel-681740.sock (pid 681740)
 ```
 
 Then connect a client to that socket and you're at a prompt inside that backend:
 
 ```console
-$ socat - UNIX-CONNECT:/tmp/pg_scalpel-679278.sock      # or: nc -U <socket>
-pg_scalpel REPL - Janet 1.41.3-dev in backend pid 679278
+$ socat - UNIX-CONNECT:/tmp/pg_scalpel-681740.sock      # or: nc -U <socket>
+pg_scalpel REPL - Janet 1.41.3-dev in backend pid 681740
 scalpel> (+ 40 2)
 42
-scalpel> (def p (scalpel/resolve "int4pl"))
-<pointer 0x629F9BE16E30>
+scalpel> (def p (scalpel/resolve "strlen"))
+<pointer 0x742E7ED9A780>
+scalpel> (scalpel/call p :uint64 [:cstring] "hello, scalpel")
+(:ok <core/u64 14>)
 scalpel> (get (scalpel/struct "Path") :size)
 80
-scalpel> (scalpel/call (scalpel/resolve "strlen") :uint64 [:cstring] "hello, scalpel")
-(:ok <core/u64 14>)
 scalpel> (error "boom")
 error: boom
-scalpel> p
-<pointer 0x629F9BE16E30>
+scalpel> (scalpel/call p :uint64 [:cstring] "still here")
+(:ok <core/u64 10>)
 scalpel> :quit
 ```
 
 Three things the one-shot form doesn't give you. State persists across lines —
-`p` is still bound after the `(error "boom")`, because it's one VM for the life
-of the connection. Results come back `%q`-formatted, so no `string/format`
-wrapper. And a Janet error is just a line that didn't work: it prints and drops
+`p` holds `strlen`'s address, so you can call through it again after the
+`(error "boom")`, because it's one VM for the life of the connection.
+Results come back `%q`-formatted, so no `string/format` wrapper. And a Janet error is just a line that didn't work: it prints and drops
 you back at the prompt instead of dropping the connection.
 
 It carries the same lock as `janet_eval` — superuser only — and the socket is
@@ -198,6 +198,32 @@ user can connect. The socket exists only while that backend is serving; `:quit`
 or disconnect to end it. The waits go through `WaitLatchOrSocket`, so a backend
 parked in the REPL still answers `pg_cancel_backend` and shutdown rather than
 going deaf.
+
+### Triggering SQL from the prompt
+
+A backend parked in the REPL is serving you, not reading SQL from a client — but
+it's still a live backend, and `scalpel/sql` runs SQL in it through SPI (the same
+path PL/pgSQL uses). So the hook-and-trigger loop happens right at the prompt:
+stand in front of `int4pl`, run the add, watch it come back changed, put it back.
+
+```console
+scalpel> (def d (scalpel/closure :uint64 [:pointer]
+                  (fn [fc] (+ (scalpel/getarg fc 0 :int) (scalpel/getarg fc 1 :int) 100))))
+<pointer 0x742E7F160FC8>
+scalpel> (scalpel/hook (scalpel/resolve "int4pl") d)
+<pointer 0x629F9C2EF058>
+scalpel> (scalpel/sql "SELECT 2 + 3 AS sum")
+(:ok @[@{:sum "105"}])
+scalpel> (scalpel/unhook (scalpel/resolve "int4pl"))
+nil
+scalpel> (scalpel/sql "SELECT 2 + 3 AS sum")
+(:ok @[@{:sum "5"}])
+scalpel> :quit
+```
+
+`scalpel/sql` runs inside the caller's transaction and hands back rows as text —
+`(:ok @[{:col val …} …])`, or `(:error …)` if the query throws, so a bad query is
+one more line that didn't work, not a dropped session.
 
 ## What's here
 
@@ -208,6 +234,8 @@ The C primitives, by what you're doing with them:
 - Calling C: `call` (guarded), `call-raw` (not), and `closure`, which turns a
   Janet function into a real C function pointer you can hand to anything that
   wants one.
+- Running SQL: `sql`, through SPI — so a hook you just set fires when the query
+  runs, right from the prompt.
 - Hooking: `hook` and `unhook`, on top of funchook.
 - Machine code: `disasm`, `scan`, `page-protect`, `flush-icache`, `image-range`.
 - Standing in for fmgr functions: `getarg`, `setresult-isnull`, `recv`.
@@ -242,23 +270,22 @@ CREATE INDEX ON t(a);
 ANALYZE t;
 ```
 
-Then load the observatory, arm it, run a query, and dump:
+Then, in a REPL on that backend, load and arm the observatory, fire the query
+with `scalpel/sql` (so `add_path` sees every path the planner builds), and dump —
+the report renders right at the prompt:
 
-```sql
-SELECT janet_eval($j$ (def PO (scalpel-load "janet-lib/planner-observatory")) (PO :arm) $j$);
-EXPLAIN (COSTS OFF) SELECT count(*) FROM t t1 JOIN t t2 USING (a) WHERE t1.b < 500;
-SELECT janet_eval($j$ (PO :dump) $j$);     -- the grouped, cost-sorted candidate report
-SELECT janet_eval($j$ (PO :disarm) $j$);
-```
-
-`(PO :dump)` prints the candidates (with that seed; exact paths and costs move
-with the data and stats). Readable node names need the server started with
-`PGJ_NODETAGS` pointing at your build's `nodetags.h`
-(`PGJ_NODETAGS=$(pg_config --includedir-server)/nodes/nodetags.h`); without it
-the types show as `Tag#N`:
-
-```
-planner candidates: 24 paths over 4 rel(s)
+```console
+scalpel> (os/setenv "PGJ_NODETAGS"
+           "/your/pg/install/include/postgresql/server/nodes/nodetags.h")
+nil
+scalpel> (def obs (scalpel-load "janet-lib/planner-observatory"))
+<function planner-observatory>
+scalpel> (obs :arm)
+armed: 3 hooks; nodetags=487
+scalpel> (scalpel/sql "EXPLAIN SELECT count(*) FROM t t1 JOIN t t2 USING (a) WHERE t1.b < 500")
+(:ok @[@{:QUERY PLAN "Aggregate  (cost=565.31..565.32 rows=1 width=8)"} … ])
+scalpel> (obs :dump)
+planner candidates: 22 paths over 3 rel(s)
   legend:  * winner (cheapest_total_path)   + survived (kept in pathlist)   x rejected (dominated/pruned)   param = per-execution cost
 
   t  (8 considered, 3 kept, 5 rejected)
@@ -285,14 +312,17 @@ planner candidates: 24 paths over 4 rel(s)
     x MergeJoin        rows=24950     cost=   488.06..887.31
     x NestLoop         rows=24950     cost=     0.28..940.59
 
-  {1}  (1 considered, 0 kept, 1 rejected)
-    x Result           rows=1         cost=     0.00..0.01
-
-  {}  (3 considered, 2 kept, 1 rejected)
+  {}  (2 considered, 2 kept, 0 rejected)
     * Agg              rows=1         cost=   565.31..565.32
     + Agg              rows=1         cost=   565.31..565.32
-    x Result           rows=1         cost=     0.00..0.01
+scalpel> (obs :disarm)
+disarmed
 ```
+
+Readable node names need `nodetags.h`: set `PGJ_NODETAGS` when you start the
+server (`PGJ_NODETAGS=$(pg_config --includedir-server)/nodes/nodetags.h`), or, as
+above, from the prompt with `os/setenv` before loading — without it the types
+show as `Tag#N`. Exact paths and costs move with the data and stats.
 
 EXPLAIN shows you the winner; this shows the eleven join paths it rejected, with
 their costs — read out of the `RelOptInfo` and `Path` structs mid-plan.
