@@ -341,12 +341,15 @@ and range-table index, so the two sides of a self-join show as `t{1}` and `t{2}`
 Exact paths and costs move with the data and stats.
 
 EXPLAIN shows you the winner. This shows what it beat and what each loser was
-made of: the hash join scans and hashes all of `t2` once, the runner-up probes
-`t2`'s index 199 times through a Memoize, and a probe costs 1.76. That price is
-high because the table has never been vacuumed — `relallvisible` is 0, so every
-index-only probe is costed as a heap visit. Run `VACUUM t` and plan it again: the
+made of: the hash join scans and hashes all of `t2` once; the runner-up probes
+`t2`'s index at 1.76 a probe, with a Memoize in front that expects most of the
+199 outer rows to repeat a value of `a` it already fetched (the plain nested
+loop, with no Memoize, is 535.34). A probe costs that much because the table has
+never been vacuumed — `relallvisible` is 0, so each index-only probe is charged
+for the heap pages it would visit. Run `VACUUM t`, `(obs :clear)` (the log
+accumulates across queries until you clear or re-arm), and plan it again: the
 probe drops to 1.30, the nested loop drops to 325.91, and it beats the unchanged
-333.44 hash join. Same data, same stats, different plan.
+333.44 hash join. Same data, same row estimates, different plan.
 
 ## The sharp end
 
