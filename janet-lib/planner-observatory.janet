@@ -3,12 +3,17 @@
 # Hooks add_path() (every candidate Path the optimizer considers for a rel) and
 # get_relation_info() (to name base rels). Decodes each Path's pathtype + costs
 # straight out of backend memory via the pg_scalpel primitives — no EXPLAIN parsing.
+# For a join candidate it also records the outer and inner paths it was built
+# from, so the report shows what each join would have run, not just its total.
 #
-#   (def PO (scalpel-load "janet-lib/planner-observatory"))
-#   (PO :arm)                 # install the hooks
+#   (def obs (scalpel-load "janet-lib/planner-observatory"))
+#   (obs :arm)                # install the hooks
 #   ... run/EXPLAIN a query in THIS session (planner fires) ...
-#   (PO :dump)                # grouped, cost-sorted candidate report (string)
-#   (PO :disarm)              # remove hooks
+#   (obs :dump)               # grouped, cost-sorted candidate report (string)
+#   (obs :disarm)             # remove hooks
+#
+# Join inputs need readable node names (PGJ_NODETAGS, below): the join, index,
+# material and memoize paths are recognized by their node tag.
 #
 # Process-local: only this backend is instrumented, and it dies with the session.
 
@@ -64,9 +69,44 @@
             (array/push out (+ (* w 64) (* byte 8) bit)))))))
   out)
 
+# Base rels are "name{relid}" so a self-join's two sides stay apart (t{1}, t{2});
+# join rels are just their relid set.
 (defn- po-rel-label [reloptptr]
-  (or (get (PO-state :relmap) reloptptr)
-      (string "{" (string/join (map string (po-relids reloptptr)) ",") "}")))
+  (def ids (string "{" (string/join (map string (po-relids reloptptr)) ",") "}"))
+  (if-let [nm (get (PO-state :relmap) reloptptr)] (string nm ids) ids))
+
+# --- describe a path's inputs ---------------------------------------------------
+# Children are decoded when the join is offered to add_path: the planner frees
+# dominated paths later, so the pointers are only good now.
+(defn- po-rel-name [oid]
+  (or (get (PO-state :names) oid)
+      (let [r (scalpel/call (scalpel/resolve "get_rel_name") :cstring [:uint] oid)
+            nm (if (and (indexed? r) (= (get r 0) :ok) (string? (get r 1))) (get r 1) (string "oid " oid))]
+        (put (PO-state :names) oid nm)
+        nm)))
+
+(defn- po-node-str [p depth]
+  (def buf (peek-bytes p 80))
+  (def tag (po-type-name (po-dec-uint buf 0 4)))         # path node tag @0 (IndexPath, HashPath, ...)
+  (def head
+    (string/format "%s %s%s  rows=%.0f cost=%.2f..%.2f%s"
+      (po-type-name (po-dec-uint buf 4 4))
+      (if (= tag "IndexPath")                            # IndexPath.indexinfo @80 -> IndexOptInfo.indexoid @4
+        (string (po-rel-name (po-dec-uint (peek-bytes (po-dec-uint (peek-bytes p 88) 80 8) 8) 4 4)) " on ")
+        "")
+      (po-rel-label (po-dec-uint buf 8 8))               # parent @8
+      (po-dec-f64 buf 40) (po-dec-f64 buf 56) (po-dec-f64 buf 64)
+      (if (not= 0 (po-dec-uint buf 24 8)) "  param" "")))
+  (if (and (< depth 2) (or (= tag "MaterialPath") (= tag "MemoizePath")))
+    (string head "\n" (string/repeat " " (* 2 (+ depth 1))) "<- "
+            (po-node-str (po-dec-uint (peek-bytes p 88) 80 8) (+ depth 1)))   # subpath @80
+    head))
+
+(defn- po-join-inputs [p tag]                   # JoinPath: outerjoinpath @88, innerjoinpath @96
+  (def jbuf (peek-bytes p 144))
+  (def sorted? (fn [off] (and (= tag "MergePath") (not= 0 (po-dec-uint jbuf off 8)))))
+  @{:outer (string (po-node-str (po-dec-uint jbuf 88 8) 0) (if (sorted? 120) "  +sort" ""))   # outersortkeys @120
+    :inner (string (po-node-str (po-dec-uint jbuf 96 8) 0) (if (sorted? 128) "  +sort" ""))}) # innersortkeys @128
 
 # --- hook callbacks -----------------------------------------------------------
 (defn- po-on-get-relation-info [args]           # (root, Oid, inhparent, rel)
@@ -82,8 +122,10 @@
   (def p   (ptr->int (get args 1)))
   (when (and rel p)
     (def buf (peek-bytes p 80))                 # Path is 80 bytes through total_cost/pathkeys
+    (def tag (po-type-name (po-dec-uint buf 0 4)))
     (array/push (PO-state :log)
-      @{:rel      (po-rel-label rel)
+      @{:inputs   (if (index-of tag ["NestPath" "MergePath" "HashPath"]) (po-join-inputs p tag))
+        :rel      (po-rel-label rel)
         :relptr   rel
         :ptr      p
         :type     (po-type-name (po-dec-uint buf 4 4))   # pathtype @4
@@ -131,6 +173,7 @@
   (put PO-state :nodetags (po-load-nodetags))
   (put PO-state :log @[])
   (put PO-state :relmap @{})
+  (put PO-state :names @{})
   (put PO-state :rels @{})
   (put PO-state :handles @[])
   (array/push (PO-state :handles)
@@ -181,10 +224,14 @@
           mark (r :type) (r :rows) (r :startup) (r :total)
           (if (r :param) "  param" "")
           (if (> (r :disabled) 0) (string "  disabled=" (r :disabled)) "")
-          (if (> (r :pworkers) 0) (string "  parallel/" (r :pworkers)) "")))))
+          (if (> (r :pworkers) 0) (string "  parallel/" (r :pworkers)) "")))
+      (when-let [ins (r :inputs)]
+        (each side [:outer :inner]
+          (buffer/push out (string/format "          %-5s %s\n" (string side)
+                                          (string/replace-all "\n" "\n            " (ins side))))))))
   (string out))
 
-# dispatch table (scalpel-load returns this; call as (PO :arm) / (PO :dump) / ...)
+# dispatch table (scalpel-load returns this; call as (obs :arm) / (obs :dump) / ...)
 (fn planner-observatory [cmd & _]
   (case cmd
     :arm    (po-arm)

@@ -255,16 +255,17 @@ work).
 
 `janet-lib/planner-observatory.janet` is a worked example: load it and it hooks
 `add_path`/`set_cheapest` to report every candidate path the planner considered
-for a query — type, costs, and which ones survived — decoded out of backend
-memory, no EXPLAIN parsing. It's also what real use looks like — a `.janet`
-program kept in a file and pulled in with `scalpel-load`, rather than pasted into
-a query.
+for a query — type, costs, which ones survived, and for each join the outer and
+inner paths it was built from — decoded out of backend memory, no EXPLAIN
+parsing. It's also what real use looks like — a `.janet` program kept in a file
+and pulled in with `scalpel-load`, rather than pasted into a query.
 
 First give the planner something to choose between — a table with rows, an index,
-and stats:
+and stats (autovacuum off so the visibility map stays where you left it; more on
+that below):
 
 ```sql
-CREATE TABLE t(a int, b int);
+CREATE TABLE t(a int, b int) WITH (autovacuum_enabled = off);
 INSERT INTO t SELECT g % 100, g FROM generate_series(1, 5000) g;
 CREATE INDEX ON t(a);
 ANALYZE t;
@@ -282,39 +283,52 @@ scalpel> (def obs (scalpel-load "janet-lib/planner-observatory"))
 <function planner-observatory>
 scalpel> (obs :arm)
 armed: 3 hooks; nodetags=487
-scalpel> (scalpel/sql "EXPLAIN SELECT count(*) FROM t t1 JOIN t t2 USING (a) WHERE t1.b < 500")
-(:ok @[@{:QUERY PLAN "Aggregate  (cost=565.31..565.32 rows=1 width=8)"} … ])
+scalpel> (scalpel/sql "EXPLAIN SELECT count(*) FROM t t1 JOIN t t2 USING (a) WHERE t1.b < 200")
+(:ok @[@{:QUERY PLAN "Aggregate  (cost=358.31..358.32 rows=1 width=8)"} … ])
 scalpel> (obs :dump)
-planner candidates: 22 paths over 3 rel(s)
+planner candidates: 17 paths over 4 rel(s)
   legend:  * winner (cheapest_total_path)   + survived (kept in pathlist)   x rejected (dominated/pruned)   param = per-execution cost
 
-  t  (8 considered, 3 kept, 5 rejected)
-    + IndexScan        rows=5         cost=     0.28..1.31       param
-    * SeqScan          rows=499       cost=     0.00..85.50
-    + IndexScan        rows=499       cost=     0.28..203.73
-    x IndexOnlyScan    rows=50        cost=     0.28..1.21       param
-    x BitmapHeapScan   rows=50        cost=     0.73..5.35       param
-    x BitmapHeapScan   rows=5         cost=     0.66..5.41       param
-    x SeqScan          rows=5000      cost=     0.00..73.00
-    x IndexOnlyScan    rows=5000      cost=     0.28..99.28
+  t{1}  (4 considered, 3 kept, 1 rejected)
+    + IndexScan        rows=2         cost=     0.28..1.31       param
+    * SeqScan          rows=199       cost=     0.00..85.50
+    + IndexScan        rows=199       cost=     0.28..203.73
+    x BitmapHeapScan   rows=2         cost=     0.66..5.41       param
 
-  {1,2}  (12 considered, 1 kept, 11 rejected)
-    * HashJoin         rows=24950     cost=   135.50..502.94
-    x NestLoop         rows=24950     cost=     0.29..524.61
-    x NestLoop         rows=24950     cost=     0.29..579.92
-    x MergeJoin        rows=24950     cost=   108.14..593.89
-    x NestLoop         rows=24950     cost=     0.57..606.20
-    x NestLoop         rows=24950     cost=     0.57..642.83
-    x MergeJoin        rows=24950     cost=     0.56..678.51
-    x MergeJoin        rows=24950     cost=     0.56..689.76
-    x HashJoin         rows=24950     cost=    91.74..739.24
-    x MergeJoin        rows=24950     cost=   488.06..864.80
-    x MergeJoin        rows=24950     cost=   488.06..887.31
-    x NestLoop         rows=24950     cost=     0.28..940.59
+  t{2}  (4 considered, 3 kept, 1 rejected)
+    + IndexOnlyScan    rows=50        cost=     0.28..1.76       param
+    * SeqScan          rows=5000      cost=     0.00..73.00
+    + IndexOnlyScan    rows=5000      cost=     0.28..191.23
+    x BitmapHeapScan   rows=50        cost=     0.81..5.44       param
+
+  {1,2}  (7 considered, 1 kept, 6 rejected)
+    * HashJoin         rows=9950      cost=   135.50..333.44
+          outer SeqScan t{1}  rows=199 cost=0.00..85.50
+          inner SeqScan t{2}  rows=5000 cost=0.00..73.00
+    x NestLoop         rows=9950      cost=     0.29..366.39
+          outer SeqScan t{1}  rows=199 cost=0.00..85.50
+          inner Memoize t{2}  rows=50 cost=0.29..1.77  param
+              <- IndexOnlyScan t_a_idx on t{2}  rows=50 cost=0.28..1.76  param
+    x NestLoop         rows=9950      cost=     0.29..392.42
+          outer SeqScan t{2}  rows=5000 cost=0.00..73.00
+          inner Memoize t{1}  rows=2 cost=0.29..1.32  param
+              <- IndexScan t_a_idx on t{1}  rows=2 cost=0.28..1.31  param
+    x MergeJoin        rows=9950      cost=    93.38..446.08
+          outer IndexOnlyScan t_a_idx on t{2}  rows=5000 cost=0.28..191.23
+          inner SeqScan t{1}  rows=199 cost=0.00..85.50  +sort
+    x NestLoop         rows=9950      cost=     0.28..535.34
+          outer SeqScan t{1}  rows=199 cost=0.00..85.50
+          inner IndexOnlyScan t_a_idx on t{2}  rows=50 cost=0.28..1.76  param
+    x HashJoin         rows=9950      cost=    87.99..585.49
+          outer SeqScan t{2}  rows=5000 cost=0.00..73.00
+          inner SeqScan t{1}  rows=199 cost=0.00..85.50
+    x MergeJoin        rows=9950      cost=   473.29..623.54
+          outer SeqScan t{1}  rows=199 cost=0.00..85.50  +sort
+          inner SeqScan t{2}  rows=5000 cost=0.00..73.00  +sort
 
   {}  (2 considered, 2 kept, 0 rejected)
-    * Agg              rows=1         cost=   565.31..565.32
-    + Agg              rows=1         cost=   565.31..565.32
+    * Agg              rows=1         cost=   358.31..358.32
+    + Agg              rows=1         cost=   358.31..358.32
 scalpel> (obs :disarm)
 disarmed
 ```
@@ -322,10 +336,17 @@ disarmed
 Readable node names need `nodetags.h`: set `PGJ_NODETAGS` when you start the
 server (`PGJ_NODETAGS=$(pg_config --includedir-server)/nodes/nodetags.h`), or, as
 above, from the prompt with `os/setenv` before loading — without it the types
-show as `Tag#N`. Exact paths and costs move with the data and stats.
+show as `Tag#N` and joins don't list their inputs. Base rels are labeled by name
+and range-table index, so the two sides of a self-join show as `t{1}` and `t{2}`.
+Exact paths and costs move with the data and stats.
 
-EXPLAIN shows you the winner; this shows the eleven join paths it rejected, with
-their costs — read out of the `RelOptInfo` and `Path` structs mid-plan.
+EXPLAIN shows you the winner. This shows what it beat and what each loser was
+made of: the hash join scans and hashes all of `t2` once, the runner-up probes
+`t2`'s index 199 times through a Memoize, and a probe costs 1.76. That price is
+high because the table has never been vacuumed — `relallvisible` is 0, so every
+index-only probe is costed as a heap visit. Run `VACUUM t` and plan it again: the
+probe drops to 1.30, the nested loop drops to 325.91, and it beats the unchanged
+333.44 hash join. Same data, same stats, different plan.
 
 ## The sharp end
 
