@@ -104,6 +104,19 @@ Flush the icache after writing code. No-op on x86-64, real on arm64.
 **`(scalpel/raise msg)`** → `(:error {...})`
 Raise a test error through the guard; always returns `(:error …)`.
 
+## Interactive REPL
+
+**`scalpel_repl()`** → `integer`  (a SQL function, not a `janet_eval` call; superuser only)
+Takes over the calling backend and serves a Janet REPL to one client over a
+Unix-domain socket at `/tmp/pg_scalpel-<pid>.sock` (`0600`, `SO_PEERCRED`
+same-uid only). Lines evaluate against this connection's VM, so hooks, patches,
+and an armed row filter persist; results are `%q`-formatted; a Janet error
+prints and the loop continues; `:quit` or a disconnect ends it. Waits go through
+`WaitLatchOrSocket`, so a parked backend still honors `pg_cancel_backend` and
+shutdown. Connect with `socat - UNIX-CONNECT:<socket>` or `nc -U <socket>`.
+Reaches only a backend you drive (you call it); a runaway form is interrupted
+only at the socket waits, not mid-eval.
+
 ---
 
 # Prelude (`janet-lib/`, auto-loaded)

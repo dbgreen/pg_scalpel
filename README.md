@@ -152,6 +152,53 @@ SELECT 'hello' AS greeting;    --  HELLO
 SELECT janet_eval($j$ (scalpel/intercept-rows nil) $j$);
 ```
 
+## An interactive REPL
+
+Everything above is one `janet_eval` at a time, typed into `psql` and wrapped in
+`SELECT janet_eval($j$ … $j$)`. For actually poking around, that wears thin.
+`scalpel_repl()` turns the backend you're connected to into a live Janet prompt.
+
+Call it in one session — it takes over that backend and blocks, serving — and it
+prints the per-pid socket it's listening on:
+
+```sql
+SELECT scalpel_repl();
+--  INFO:  pg_scalpel REPL listening on /tmp/pg_scalpel-679278.sock (pid 679278)
+```
+
+Then connect a client to that socket and you're at a prompt inside that backend:
+
+```console
+$ socat - UNIX-CONNECT:/tmp/pg_scalpel-679278.sock      # or: nc -U <socket>
+pg_scalpel REPL - Janet 1.41.3-dev in backend pid 679278
+scalpel> (+ 40 2)
+42
+scalpel> (def p (scalpel/resolve "int4pl"))
+<pointer 0x629F9BE16E30>
+scalpel> (get (scalpel/struct "Path") :size)
+80
+scalpel> (scalpel/call (scalpel/resolve "strlen") :uint64 [:cstring] "hello, scalpel")
+(:ok <core/u64 14>)
+scalpel> (error "boom")
+error: boom
+scalpel> p
+<pointer 0x629F9BE16E30>
+scalpel> :quit
+```
+
+Three things the one-shot form doesn't give you. State persists across lines —
+`p` is still bound after the `(error "boom")`, because it's one VM for the life
+of the connection. Results come back `%q`-formatted, so no `string/format`
+wrapper. And a Janet error is just a line that didn't work: it prints and drops
+you back at the prompt instead of dropping the connection.
+
+It carries the same lock as `janet_eval` — superuser only — and the socket is
+`0600` and `SO_PEERCRED`-gated, so only a client running as the backend's own OS
+user can connect. The socket exists only while that backend is serving; `:quit`
+or disconnect to end it. The waits go through `WaitLatchOrSocket`, so a backend
+parked in the REPL still answers `pg_cancel_backend` and shutdown rather than
+going deaf.
+
 ## What's here
 
 The C primitives, by what you're doing with them:
