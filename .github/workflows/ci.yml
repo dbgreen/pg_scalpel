@@ -1,0 +1,85 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+# pg_scalpel leans on DWARF (struct/sig) and symbol resolution, so we build
+# PostgreSQL from source with debug info rather than use a (stripped) package.
+# PG 19 is pre-release; pin the ref here. The built tree is cached, so it only
+# compiles on the first run (or when PG_REF changes).
+env:
+  PG_REF: REL_19_STABLE
+  PGINST: /home/runner/pginstall
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (with submodules)
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake bison flex \
+            libffi-dev libdw-dev libelf-dev
+
+      - name: Cache PostgreSQL build
+        id: pgcache
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.PGINST }}
+          key: pg-${{ env.PG_REF }}-${{ runner.os }}-rel-v1
+
+      - name: Build PostgreSQL from source (-O2, split debug)
+        if: steps.pgcache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch "$PG_REF" https://github.com/postgres/postgres.git pgsrc
+          cd pgsrc
+          # Production shape: configure defaults to -O2; --enable-debug adds -g.
+          # No --enable-cassert (this is a release build).
+          ./configure --prefix="$PGINST" --enable-debug \
+            --without-icu --without-readline --without-zlib
+          make -j"$(nproc)"
+          make install
+          # Split the debug info into a separate file next to the binary, found
+          # via .gnu_debuglink. Packaged builds ship this way, so pg_scalpel's
+          # DWARF reader has to handle it. The smoke test's struct-layout check
+          # covers it.
+          cd "$PGINST/bin"
+          objcopy --only-keep-debug postgres postgres.debug
+          strip --strip-all postgres
+          objcopy --add-gnu-debuglink=postgres.debug postgres
+          chmod 0644 postgres.debug
+
+      - name: Build and install pg_scalpel
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          make vendor
+          make
+          make install
+
+      - name: Start a throwaway cluster
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          initdb -D "$PWD/pgdata" -A trust -U postgres >/dev/null
+          echo "port = 5455" >> pgdata/postgresql.conf
+          echo "listen_addresses = '127.0.0.1'" >> pgdata/postgresql.conf
+          pg_ctl -D "$PWD/pgdata" -l pgdata/log -w start
+
+      - name: Smoke tests
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          PGHOST=127.0.0.1 PGPORT=5455 PGSUPER=postgres bash .github/smoke.sh
+
+      - name: Stop cluster
+        if: always()
+        run: |
+          export PATH="$PGINST/bin:$PATH"
+          pg_ctl -D "$PWD/pgdata" stop || true

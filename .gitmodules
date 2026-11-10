@@ -1,0 +1,8 @@
+[submodule "vendor/janet"]
+	path = vendor/janet
+	url = https://github.com/janet-lang/janet.git
+	ignore = untracked
+[submodule "vendor/funchook"]
+	path = vendor/funchook
+	url = https://github.com/kubo/funchook.git
+	ignore = untracked
