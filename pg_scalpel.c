@@ -1685,6 +1685,20 @@ pgs_repl_run_line(const char *src, Janet *out, char **pgerr)
 	return rc;
 }
 
+static bool
+pgs_repl_incomplete(const char *src, size_t len)
+{
+	JanetParser p;
+	bool		pending;
+
+	janet_parser_init(&p);
+	for (size_t i = 0; i < len && janet_parser_status(&p) != JANET_PARSE_ERROR; i++)
+		janet_parser_consume(&p, (uint8_t) src[i]);
+	pending = janet_parser_status(&p) == JANET_PARSE_PENDING;
+	janet_parser_deinit(&p);
+	return pending;
+}
+
 /*
  * Serve an interactive Janet REPL to one client over the transport layer (a
  * per-pid Unix socket). Blocks the calling backend until the client sends
@@ -1704,6 +1718,8 @@ scalpel_repl_serve(void)
 	char	   *endpoint = NULL;
 	char	   *buf = palloc(65536);
 	char		greeting[128];
+	StringInfoData pending;
+	bool		consumed = false;
 
 	PG_TRY();
 	{
@@ -1729,20 +1745,35 @@ scalpel_repl_serve(void)
 				 "pg_scalpel REPL - Janet %s in backend pid %d\nscalpel> ",
 				 JANET_VERSION, (int) MyProcPid);
 		pgs_transport_write(c, greeting, (int) strlen(greeting));
+		initStringInfo(&pending);
 
 		while ((n = pgs_transport_read(c, buf, 65535)) > 0)
 		{
 			Janet		out = janet_wrap_nil();
-			char	   *s = buf;
+			char	   *s;
 			Janet		outkw = janet_ckeywordv("out");
 			JanetBuffer *cap;
 			char	   *pgerr = NULL;
 			int			rc;
 
-			buf[n] = '\0';
-			while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' ||
-							 buf[n - 1] == ' ' || buf[n - 1] == '\t'))
-				buf[--n] = '\0';
+			if (consumed)
+			{
+				resetStringInfo(&pending);
+				consumed = false;
+			}
+			appendBinaryStringInfo(&pending, buf, n);
+			if (pgs_repl_incomplete(pending.data, pending.len))
+			{
+				pgs_transport_write(c, "    ...> ", 9);
+				continue;
+			}
+			consumed = true;
+
+			while (pending.len > 0 &&
+				   (pending.data[pending.len - 1] == '\n' || pending.data[pending.len - 1] == '\r' ||
+					pending.data[pending.len - 1] == ' ' || pending.data[pending.len - 1] == '\t'))
+				pending.data[--pending.len] = '\0';
+			s = pending.data;
 			while (*s == ' ' || *s == '\t')
 				s++;
 
