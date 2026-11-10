@@ -13,6 +13,7 @@
 #include "dlfcn.h"
 #include <sys/mman.h>
 #include <errno.h>
+#include <pthread.h>
 #include <string.h>
 #include "janet.h"
 #include <ffi.h>
@@ -90,11 +91,60 @@ static bool started = false;
 static PgsTimer *pgs_timer = NULL;
 static int	pgs_janet_depth = 0;
 
+/*
+ * Janet counts interrupts, and a tick that lands while a C call is running
+ * can't be answered until it returns, so a long call used to pile several up.
+ * Whatever was left when the form finished went into the next eval, where it
+ * interrupted macro expansion inside the compiler and came out as an empty
+ * "(macro)" error. So at most one is ever outstanding (pgs_irq_pending, set
+ * only by the timer thread, cleared only here), none is raised while code is
+ * compiling, and any left over is taken back when a form finishes.
+ */
+static pthread_mutex_t pgs_irq_lock = PTHREAD_MUTEX_INITIALIZER;
+static bool pgs_irq_pending = false;
+static int	pgs_compiling = 0;
+
 static void
 pgs_interrupt_cb(void *vm)
 {
-	if (__atomic_load_n(&pgs_janet_depth, __ATOMIC_RELAXED) > 0)
+	pthread_mutex_lock(&pgs_irq_lock);
+	if (__atomic_load_n(&pgs_janet_depth, __ATOMIC_RELAXED) > 0 &&
+		pgs_compiling == 0 && !pgs_irq_pending)
+	{
+		pgs_irq_pending = true;
 		janet_interpreter_interrupt((JanetVM *) vm);
+	}
+	pthread_mutex_unlock(&pgs_irq_lock);
+}
+
+/* take back the outstanding interrupt, if there is one */
+static void
+pgs_irq_take(void)
+{
+	pthread_mutex_lock(&pgs_irq_lock);
+	if (pgs_irq_pending)
+	{
+		pgs_irq_pending = false;
+		janet_interpreter_interrupt_handled(janet_local_vm());
+	}
+	pthread_mutex_unlock(&pgs_irq_lock);
+}
+
+static void
+pgs_compile_begin(void)
+{
+	pthread_mutex_lock(&pgs_irq_lock);
+	pgs_compiling++;
+	pthread_mutex_unlock(&pgs_irq_lock);
+	pgs_irq_take();
+}
+
+static void
+pgs_compile_end(void)
+{
+	pthread_mutex_lock(&pgs_irq_lock);
+	pgs_compiling--;
+	pthread_mutex_unlock(&pgs_irq_lock);
 }
 
 static inline void
@@ -571,9 +621,10 @@ pgs_pcall(JanetFunction *fn, int32_t argc, const Janet *argv, Janet *out)
 		while (sig == JANET_SIGNAL_INTERRUPT)
 		{
 			CHECK_FOR_INTERRUPTS();
-			janet_interpreter_interrupt_handled(janet_local_vm());
+			pgs_irq_take();
 			sig = janet_continue(fiber, janet_wrap_nil(), out);
 		}
+		pgs_irq_take();
 	}
 	PG_CATCH();
 	{
@@ -1507,38 +1558,49 @@ pgs_vm_ensure(void)
 static JanetSignal
 pgs_run_form(Janet form, const char *where, Janet *out)
 {
-	JanetVM    *vm = janet_local_vm();
 	int			gclock;
 	JanetCompileResult cr;
-	JanetFiber *fiber;
-	JanetSignal sig;
-
-	gclock = janet_gclock();
-	cr = janet_compile(form, pgs_env, janet_cstring(where));
-	if (cr.status == JANET_COMPILE_ERROR)
-	{
-		janet_gcunlock(gclock);
-		*out = janet_wrap_string(cr.error);
-		return JANET_SIGNAL_ERROR;
-	}
-	fiber = janet_fiber(janet_thunk(cr.funcdef), 64, 0, NULL);
-	fiber->env = pgs_env;
-	janet_gcunlock(gclock);
+	JanetFiber *volatile fiber = NULL;
+	volatile bool compiling = false;
+	JanetSignal sig = JANET_SIGNAL_ERROR;
 
 	PG_TRY();
 	{
-		for (;;)
+		gclock = janet_gclock();
+		pgs_compile_begin();
+		compiling = true;
+		cr = janet_compile(form, pgs_env, janet_cstring(where));
+		pgs_compile_end();
+		compiling = false;
+
+		if (cr.status == JANET_COMPILE_ERROR)
 		{
-			sig = janet_continue(fiber, janet_wrap_nil(), out);
-			if (sig != JANET_SIGNAL_INTERRUPT)
-				break;
-			CHECK_FOR_INTERRUPTS();
-			janet_interpreter_interrupt_handled(vm);
+			janet_gcunlock(gclock);
+			*out = janet_wrap_string(cr.error);
+		}
+		else
+		{
+			fiber = janet_fiber(janet_thunk(cr.funcdef), 64, 0, NULL);
+			fiber->env = pgs_env;
+			janet_gcunlock(gclock);
+
+			for (;;)
+			{
+				sig = janet_continue(fiber, janet_wrap_nil(), out);
+				if (sig != JANET_SIGNAL_INTERRUPT)
+					break;
+				CHECK_FOR_INTERRUPTS();
+				pgs_irq_take();
+			}
+			pgs_irq_take();
 		}
 	}
 	PG_CATCH();
 	{
-		pgs_unroot_fiber(fiber);
+		if (compiling)
+			pgs_compile_end();
+		if (fiber != NULL)
+			pgs_unroot_fiber(fiber);
 		PG_RE_THROW();
 	}
 	PG_END_TRY();
