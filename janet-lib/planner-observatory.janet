@@ -1,13 +1,15 @@
 # planner-observatory.janet: live report of the planner's path candidates.
 #
-# Hooks add_path() (every candidate Path the optimizer considers for a rel) and
-# get_relation_info() (to name base rels). Decodes each Path's pathtype and costs
-# from backend memory with the pg_scalpel primitives. No EXPLAIN parsing.
-# For a join candidate it also records the outer and inner paths it was built
-# from, so the report shows each join's inputs as well as its total.
+# Hooks add_path() (every candidate Path the optimizer costs and offers for a
+# rel) and get_relation_info() (to name base rels). Decodes each Path's pathtype
+# and costs straight out of backend memory. The field offsets it reads are pulled
+# from the running binary's DWARF via scalpel/struct at arm time -- not hardcoded
+# -- so the decode follows the struct layout across builds and PG versions. No
+# EXPLAIN parsing. For a join candidate it also records the outer and inner paths
+# it was built from, so the report shows each join's inputs as well as its total.
 #
 #   (def obs (scalpel-load "janet-lib/planner-observatory"))
-#   (obs :arm)                # install the hooks
+#   (obs :arm)                # resolve the layouts, then install the hooks
 #   ... run/EXPLAIN a query in THIS session (planner fires) ...
 #   (obs :dump)               # grouped, cost-sorted candidate report (string)
 #   (obs :disarm)             # remove hooks
@@ -17,25 +19,39 @@
 #
 # Process-local: only this backend is instrumented, and it dies with the session.
 
-(def PO-state @{:log @[] :relmap @{} :nodetags @{} :handles @[]})
+(def PO-state @{:log @[] :relmap @{} :nodetags @{} :handles @[] :off @{}})
 
-# --- IEEE-754 f64 decode (Cost/Cardinality are f64, which read-struct skips) ---
+# The node structs whose field offsets we read. All are plain structs (or
+# typedefs to one), so scalpel/struct resolves each and gives us its members.
+(def PO-structs
+  [:Path :RelOptInfo :Bitmapset :List
+   :IndexPath :IndexOptInfo :JoinPath :MergePath :MaterialPath :MemoizePath])
+
+# Two widths scalpel/struct can't hand us, and that are fixed 64-bit PG ABI
+# anyway. scalpel/struct introspects STRUCTs; a ListCell is a union and a
+# bitmapword a scalar typedef, so neither exposes member offsets to read. Both
+# are stable infrastructure, not the node layouts that actually churn.
+(def PO-CELL 8)   # sizeof(ListCell): union { void* ; int ; Oid ; ... } -> pointer-sized
+(def PO-WORD 8)   # sizeof(bitmapword) on a 64-bit build
+
+# --- offset lookup + typed reads at (ptr + offset) ----------------------------
+# po-o returns the DWARF offset of a field, resolved at arm (see po-load-offsets).
+# po-u32 / po-ptr / po-f64 read one field straight from live memory at base+off.
+# A Path's rows/startup_cost/total_cost are C doubles; read-f64 (from the prelude,
+# scalpel-lib's dec-f64) reconstructs those -- we don't reimplement the decode.
+# Integers and pointers we decode here (multiply/add, since Janet bit ops are 32-bit).
 (defn- po-dec-uint [buf off n]
   (var acc 0) (var mul 1)
   (for i 0 n (+= acc (* (in buf (+ off i)) mul)) (set mul (* mul 256)))
   acc)
 
-(defn- po-dec-f64 [buf off]
-  (def b (fn [i] (in buf (+ off i))))
-  (def b7 (b 7)) (def b6 (b 6))
-  (def sign (if (>= b7 128) -1 1))
-  (def exp (+ (* (band b7 0x7f) 16) (brshift b6 4)))
-  (def mant (+ (* (band b6 0x0f) 281474976710656) (* (b 5) 1099511627776)
-               (* (b 4) 4294967296) (* (b 3) 16777216) (* (b 2) 65536) (* (b 1) 256) (b 0)))
-  (cond
-    (= exp 0)    (* sign mant (math/pow 2 -1074))
-    (= exp 2047) (if (= mant 0) (* sign math/inf) math/nan)
-    (* sign (+ 1 (/ mant 4503599627370496)) (math/pow 2 (- exp 1023)))))
+(defn- po-o [s f]
+  (or (get-in PO-state [:off s f])
+      (errorf "planner-observatory: offset for %p.%p missing from DWARF layout" s f)))
+
+(defn- po-u32 [base off] (po-dec-uint (peek-bytes (+ base off) 4) 0 4))
+(defn- po-ptr [base off] (po-dec-uint (peek-bytes (+ base off) 8) 0 8))
+(defn- po-f64 [base off] (read-f64 (+ base off)))
 
 # --- NodeTag int -> name, from the build's generated header -------------------
 (defn- po-load-nodetags []
@@ -55,15 +71,14 @@
 
 # --- decode a RelOptInfo's relids Bitmapset into a set of RTE indexes ----------
 (defn- po-relids [reloptptr]
-  (def rbuf (peek-bytes reloptptr 16))          # RelOptInfo.relids @8 -> Bitmapset*
-  (def bms (po-dec-uint rbuf 8 8))
+  (def bms (po-ptr reloptptr (po-o :RelOptInfo :relids)))      # relids -> Bitmapset*
   (def out @[])
   (when (not= bms 0)
-    (def nwords (po-dec-uint (peek-bytes (+ bms 4) 4) 0 4))   # Bitmapset.nwords @4
-    (def wbuf (peek-bytes (+ bms 8) (* nwords 8)))            # words @8, bytewise (avoids f64 loss)
+    (def nwords (po-u32 bms (po-o :Bitmapset :nwords)))
+    (def wbuf (peek-bytes (+ bms (po-o :Bitmapset :words)) (* nwords PO-WORD)))  # bytewise (avoids f64 loss)
     (for w 0 nwords
-      (for byte 0 8
-        (def bv (in wbuf (+ (* w 8) byte)))
+      (for byte 0 PO-WORD
+        (def bv (in wbuf (+ (* w PO-WORD) byte)))
         (for bit 0 8
           (when (not= 0 (band bv (blshift 1 bit)))
             (array/push out (+ (* w 64) (* byte 8) bit)))))))
@@ -86,27 +101,28 @@
         nm)))
 
 (defn- po-node-str [p depth]
-  (def buf (peek-bytes p 80))
-  (def tag (po-type-name (po-dec-uint buf 0 4)))         # path node tag @0 (IndexPath, HashPath, ...)
+  (def tag (po-type-name (po-u32 p (po-o :Path :type))))         # Path.type: the node's own tag
   (def head
     (string/format "%s %s%s  rows=%.0f cost=%.2f..%.2f%s"
-      (po-type-name (po-dec-uint buf 4 4))
-      (if (= tag "IndexPath")                            # IndexPath.indexinfo @80 -> IndexOptInfo.indexoid @4
-        (string (po-rel-name (po-dec-uint (peek-bytes (po-dec-uint (peek-bytes p 88) 80 8) 8) 4 4)) " on ")
+      (po-type-name (po-u32 p (po-o :Path :pathtype)))           # Path.pathtype: scan/join kind
+      (if (= tag "IndexPath")
+        (let [ii (po-ptr p (po-o :IndexPath :indexinfo))]        # IndexPath.indexinfo -> IndexOptInfo*
+          (string (po-rel-name (po-u32 ii (po-o :IndexOptInfo :indexoid))) " on "))
         "")
-      (po-rel-label (po-dec-uint buf 8 8))               # parent @8
-      (po-dec-f64 buf 40) (po-dec-f64 buf 56) (po-dec-f64 buf 64)
-      (if (not= 0 (po-dec-uint buf 24 8)) "  param" "")))
+      (po-rel-label (po-ptr p (po-o :Path :parent)))             # Path.parent -> RelOptInfo*
+      (po-f64 p (po-o :Path :rows))
+      (po-f64 p (po-o :Path :startup_cost))
+      (po-f64 p (po-o :Path :total_cost))
+      (if (not= 0 (po-ptr p (po-o :Path :param_info))) "  param" "")))
   (if (and (< depth 2) (or (= tag "MaterialPath") (= tag "MemoizePath")))
     (string head "\n" (string/repeat " " (* 2 (+ depth 1))) "<- "
-            (po-node-str (po-dec-uint (peek-bytes p 88) 80 8) (+ depth 1)))   # subpath @80
+            (po-node-str (po-ptr p (po-o (if (= tag "MemoizePath") :MemoizePath :MaterialPath) :subpath)) (+ depth 1)))
     head))
 
-(defn- po-join-inputs [p tag]                   # JoinPath: outerjoinpath @88, innerjoinpath @96
-  (def jbuf (peek-bytes p 144))
-  (def sorted? (fn [off] (and (= tag "MergePath") (not= 0 (po-dec-uint jbuf off 8)))))
-  @{:outer (string (po-node-str (po-dec-uint jbuf 88 8) 0) (if (sorted? 120) "  +sort" ""))   # outersortkeys @120
-    :inner (string (po-node-str (po-dec-uint jbuf 96 8) 0) (if (sorted? 128) "  +sort" ""))}) # innersortkeys @128
+(defn- po-join-inputs [p tag]                   # JoinPath base: outerjoinpath / innerjoinpath
+  (def sorted? (fn [field] (and (= tag "MergePath") (not= 0 (po-ptr p (po-o :MergePath field))))))
+  @{:outer (string (po-node-str (po-ptr p (po-o :JoinPath :outerjoinpath)) 0) (if (sorted? :outersortkeys) "  +sort" ""))
+    :inner (string (po-node-str (po-ptr p (po-o :JoinPath :innerjoinpath)) 0) (if (sorted? :innersortkeys) "  +sort" ""))})
 
 # --- hook callbacks -----------------------------------------------------------
 (defn- po-on-get-relation-info [args]           # (root, Oid, inhparent, rel)
@@ -121,20 +137,19 @@
   (def rel (ptr->int (get args 0)))
   (def p   (ptr->int (get args 1)))
   (when (and rel p)
-    (def buf (peek-bytes p 80))                 # Path is 80 bytes through total_cost/pathkeys
-    (def tag (po-type-name (po-dec-uint buf 0 4)))
+    (def tag (po-type-name (po-u32 p (po-o :Path :type))))       # the Path node's own tag
     (array/push (PO-state :log)
       @{:inputs   (if (index-of tag ["NestPath" "MergePath" "HashPath"]) (po-join-inputs p tag))
         :rel      (po-rel-label rel)
         :relptr   rel
         :ptr      p
-        :type     (po-type-name (po-dec-uint buf 4 4))   # pathtype @4
-        :rows     (po-dec-f64 buf 40)                    # rows @40
-        :startup  (po-dec-f64 buf 56)                    # startup_cost @56
-        :total    (po-dec-f64 buf 64)                    # total_cost @64
-        :disabled (po-dec-uint buf 48 4)                 # disabled_nodes @48
-        :param    (not= 0 (po-dec-uint buf 24 8))        # param_info @24 (non-NULL => parameterized)
-        :pworkers (po-dec-uint buf 36 4)})))             # parallel_workers @36
+        :type     (po-type-name (po-u32 p (po-o :Path :pathtype)))
+        :rows     (po-f64 p (po-o :Path :rows))
+        :startup  (po-f64 p (po-o :Path :startup_cost))
+        :total    (po-f64 p (po-o :Path :total_cost))
+        :disabled (po-u32 p (po-o :Path :disabled_nodes))
+        :param    (not= 0 (po-ptr p (po-o :Path :param_info)))   # param_info non-NULL => parameterized
+        :pworkers (po-u32 p (po-o :Path :parallel_workers))})))
 
 # set_cheapest(rel) runs after every candidate is in. By then rel->pathlist holds
 # only the paths add_path kept, and cheapest_total_path is the winner. Capture
@@ -142,36 +157,50 @@
 (defn- po-list-ptrs [listptr]           # read a pg List of pointers -> array of ints
   (def out @[])
   (when (not= listptr 0)
-    (def hdr (peek-bytes listptr 24))                    # length @4, elements @16
-    (def len (po-dec-uint hdr 4 4))
-    (def elems (po-dec-uint hdr 16 8))
+    (def len   (po-u32 listptr (po-o :List :length)))
+    (def elems (po-ptr listptr (po-o :List :elements)))
     (when (and (> len 0) (not= elems 0))
-      (def cbuf (peek-bytes elems (* len 8)))            # ListCell[] , ptr_value @0, 8 bytes each
-      (for i 0 len (array/push out (po-dec-uint cbuf (* i 8) 8)))))
+      (def cbuf (peek-bytes elems (* len PO-CELL)))             # ListCell[]: ptr_value @0 of each cell
+      (for i 0 len (array/push out (po-dec-uint cbuf (* i PO-CELL) 8)))))
   out)
 
 # Classify by a (type|startup|total) signature read from the live pathlist, not by
 # raw pointer. The planner pfrees dominated paths and reuses their addresses, so
 # pointers collide across a run. Every path in pathlist is still live at
 # set_cheapest, so there is no reuse there.
-(defn- po-path-sig-at [pbuf]
-  (string (po-type-name (po-dec-uint pbuf 4 4)) "|" (po-dec-f64 pbuf 56) "|" (po-dec-f64 pbuf 64)))
+(defn- po-path-sig-at [p]
+  (string (po-type-name (po-u32 p (po-o :Path :pathtype))) "|"
+          (po-f64 p (po-o :Path :startup_cost)) "|"
+          (po-f64 p (po-o :Path :total_cost))))
 
 (defn- po-on-set-cheapest [args ret]    # on-leave: cheapest_total_path is set by now
   (def rel (ptr->int (get args 0)))
   (when rel
-    (def rbuf (peek-bytes rel 88))                       # pathlist @48, cheapest_total_path @80
     (def kept @{})
-    (each pp (po-list-ptrs (po-dec-uint rbuf 48 8))
-      (when (not= pp 0) (put kept (po-path-sig-at (peek-bytes pp 80)) true)))
-    (def wptr (po-dec-uint rbuf 80 8))
+    (each pp (po-list-ptrs (po-ptr rel (po-o :RelOptInfo :pathlist)))
+      (when (not= pp 0) (put kept (po-path-sig-at pp) true)))
+    (def wptr (po-ptr rel (po-o :RelOptInfo :cheapest_total_path)))
     (put (PO-state :rels) rel
-      @{:kept kept :winner (if (= wptr 0) nil (po-path-sig-at (peek-bytes wptr 80)))}))
+      @{:kept kept :winner (if (= wptr 0) nil (po-path-sig-at wptr))}))
   ret)
 
 # --- control ------------------------------------------------------------------
+# Resolve every struct's field offsets once, from the running binary's DWARF.
+# If debug info is missing scalpel/struct returns nil and we fail loudly here
+# rather than decode against guessed offsets.
+(defn- po-load-offsets []
+  (def off @{})
+  (each s PO-structs
+    (def l (scalpel/struct (string s)))
+    (unless l (errorf "planner-observatory: no DWARF layout for %s (debug info missing?)" s))
+    (def by @{})
+    (each f (l :fields) (put by (keyword (f :name)) (f :offset)))
+    (put off s by))
+  off)
+
 (defn- po-arm []
   (put PO-state :nodetags (po-load-nodetags))
+  (put PO-state :off (po-load-offsets))
   (put PO-state :log @[])
   (put PO-state :relmap @{})
   (put PO-state :names @{})
@@ -183,7 +212,8 @@
     (hook-fn "add_path" :void [:pointer :pointer] :on-enter po-on-add-path))
   (array/push (PO-state :handles)
     (hook-fn "set_cheapest" :void [:pointer] :on-leave po-on-set-cheapest))
-  (string "armed: " (length (PO-state :handles)) " hooks; nodetags=" (length (PO-state :nodetags))))
+  (string "armed: " (length (PO-state :handles)) " hooks; nodetags=" (length (PO-state :nodetags))
+          "; structs=" (length (PO-state :off))))
 
 (defn- po-disarm []
   (each nm ["add_path" "get_relation_info" "set_cheapest"]
