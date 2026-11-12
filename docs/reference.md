@@ -189,8 +189,9 @@ Same as `make-struct`, but takes a `layout` from `scalpel/struct`.
 
 **`(read-struct layout buf)`** returns `@{...}`.
 Decodes a buffer (from `peek-bytes`, for example) into a table of field names
-and values. It only reads integer, pointer, and bool fields. Float, double, and
-aggregate fields are skipped.
+and values. It reads integer, pointer, bool, float, and double fields. Bitfields,
+int128, long double, and aggregate (struct/union/array) fields have no single
+number value and are skipped.
 
 **`(scalpel-load relpath)`** returns a value.
 Loads a `.janet` file relative to `scalpel-root` and returns its last value.
@@ -241,5 +242,11 @@ them back.
 
 **`(poke-bytes addr bytes)`** returns addr. Writes bytes. It makes the page
 writable, copies, flushes the icache, and restores the protection.
+
+**`(read-f64 addr)`** / **`(read-f32 addr)`** return a number. Read an IEEE-754
+double or single from memory at `addr`. **`(dec-f64 buf off)`** / **`(dec-f32 buf
+off)`** are the byte-buffer decoders behind them: this Janet writes floats
+natively but can't read them back, so these reconstruct the value (a Janet number
+is itself an f64, so it round-trips exactly).
 
 **`(ptr->int p)`** returns a number, the address in a pointer.

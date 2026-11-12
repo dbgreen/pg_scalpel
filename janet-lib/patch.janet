@@ -38,6 +38,14 @@
   (scalpel/call-raw (scalpel/resolve "memcpy") :pointer [:bytes :pointer :uint64] buf (addr-of addr) n)
   buf)
 
+(defn read-f64
+  "Read an IEEE-754 double (8 bytes) from memory at ADDR, as a Janet number (dec-f64)."
+  [addr] (dec-f64 (peek-bytes addr 8) 0))
+
+(defn read-f32
+  "Read an IEEE-754 single (4 bytes) from memory at ADDR, as a Janet number (dec-f32)."
+  [addr] (dec-f32 (peek-bytes addr 4) 0))
+
 (defn poke-bytes
   ``Write BYTES into address ADDR: make the page writable+executable, copy,
   flush the instruction cache, then restore read+execute protection.

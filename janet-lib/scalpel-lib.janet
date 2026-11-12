@@ -60,10 +60,42 @@
     (set mul (* mul 256)))
   acc)
 
+(defn dec-f64
+  ``Reconstruct an IEEE-754 double from the 8 little-endian bytes of BUF at OFF.
+  This Janet has a native float writer (buffer/push-float64) but no reader, and a
+  Janet number IS an f64, so the value round-trips exactly. Handles zero and
+  subnormals, +/-inf and NaN.``
+  [buf off]
+  (def b (fn [i] (in buf (+ off i))))
+  (def b7 (b 7)) (def b6 (b 6))
+  (def sign (if (>= b7 128) -1 1))
+  (def exp (+ (* (band b7 0x7f) 16) (brshift b6 4)))
+  (def mant (+ (* (band b6 0x0f) 281474976710656) (* (b 5) 1099511627776)
+               (* (b 4) 4294967296) (* (b 3) 16777216) (* (b 2) 65536) (* (b 1) 256) (b 0)))
+  (cond
+    (= exp 0)    (* sign mant (math/pow 2 -1074))
+    (= exp 2047) (if (= mant 0) (* sign math/inf) math/nan)
+    (* sign (+ 1 (/ mant 4503599627370496)) (math/pow 2 (- exp 1023)))))
+
+(defn dec-f32
+  ``Reconstruct an IEEE-754 single from the 4 little-endian bytes of BUF at OFF,
+  widened to a Janet f64 (exactly). Handles zero and subnormals, +/-inf and NaN.``
+  [buf off]
+  (def b (fn [i] (in buf (+ off i))))
+  (def b3 (b 3)) (def b2 (b 2))
+  (def sign (if (>= b3 128) -1 1))
+  (def exp (+ (* (band b3 0x7f) 2) (brshift b2 7)))
+  (def mant (+ (* (band b2 0x7f) 65536) (* (b 1) 256) (b 0)))
+  (cond
+    (= exp 0)   (* sign mant (math/pow 2 -149))
+    (= exp 255) (if (= mant 0) (* sign math/inf) math/nan)
+    (* sign (+ 1 (/ mant 8388608)) (math/pow 2 (- exp 127)))))
+
 (defn read-struct
-  ``Read integer/pointer/bool fields out of BUF per LAYOUT into a name->value
-  table (e.g. to inspect an output struct a call filled in). float/double and
-  aggregate fields are skipped.``
+  ``Read scalar fields out of BUF per LAYOUT into a name->value table (e.g. to
+  inspect an output struct a call filled in). Decodes integer/pointer/bool and
+  float/double fields. long double, int128, bitfields, and aggregate
+  (struct/union/array) fields have no single Janet-number value and are skipped.``
   [layout buf]
   (def out @{})
   (each f (layout :fields)
@@ -83,6 +115,8 @@
         :uchar   (in buf o)
         :short   (let [u (dec-uint buf o 2)] (if (>= u 0x8000) (- u 0x10000) u))
         :ushort  (dec-uint buf o 2)
+        :double  (dec-f64 buf o)
+        :float   (dec-f32 buf o)
         nil))
     (when (not= v nil) (put out (f :name) v)))
   out)
